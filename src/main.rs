@@ -1,3 +1,6 @@
+mod cli;
+mod kernel;
+
 fn main() {
-    println!("Hello, world!");
+    std::process::exit(cli::run());
 }
