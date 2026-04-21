@@ -1,3 +1,5 @@
+pub mod audit;
+pub mod keyring;
 pub mod policy;
 pub mod sandbox;
 pub mod tools;
@@ -17,6 +19,15 @@ pub enum KernelError {
 
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("audit log corrupted at seq {sequence_no}: {reason}")]
+    AuditCorrupted { sequence_no: u64, reason: String },
+
+    #[error("audit error: {0}")]
+    Audit(String),
+
+    #[error("keyring error: {0}")]
+    Keyring(String),
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;
