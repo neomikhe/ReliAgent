@@ -2,21 +2,26 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-use crate::kernel::audit::{AuditLog, AuditStatus};
+use crate::kernel::audit::AuditStatus;
 use crate::kernel::keyring;
 use crate::kernel::sandbox::Sandbox;
+use crate::kernel::store::AuditStore;
 use crate::kernel::{KernelError, tools};
 
 #[derive(Parser)]
 #[command(
     name = "reli",
     version,
-    about = "ReliAgent Trust Kernel (v0.0.2 — write_file + path_jail + audit chain)"
+    about = "ReliAgent Trust Kernel (v0.0.3 — write_file + path_jail + SQLite audit + anchor)"
 )]
 struct Cli {
     /// Ruta raíz del sandbox. Por defecto: ~/ReliAgent_Sandbox
     #[arg(long, global = true)]
     sandbox: Option<PathBuf>,
+
+    /// Directorio donde vive el audit.db y los anchor.log. Por defecto: ~/.reliagent
+    #[arg(long, global = true)]
+    audit_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -33,8 +38,7 @@ enum Command {
     },
     /// Muestra la ruta del sandbox resuelta
     SandboxPath,
-    /// Self-test de la cadena firmada: genera un log en memoria y valida integridad.
-    /// Nota: v0.0.2 aún no persiste el log en disco.
+    /// Verifica la integridad del audit log persistente (SQLite + anchor.log).
     Verify,
 }
 
@@ -44,15 +48,22 @@ struct WriteFileArgs<'a> {
     bytes: usize,
 }
 
-fn default_sandbox_path() -> PathBuf {
-    let home = std::env::var_os("USERPROFILE")
+fn default_home() -> PathBuf {
+    std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    home.join("ReliAgent_Sandbox")
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
-fn load_audit_log() -> Result<AuditLog, i32> {
+fn default_sandbox_path() -> PathBuf {
+    default_home().join("ReliAgent_Sandbox")
+}
+
+fn default_audit_dir() -> PathBuf {
+    default_home().join(".reliagent")
+}
+
+fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     let (key, created) = match keyring::load_or_create_audit_key() {
         Ok(k) => k,
         Err(e) => {
@@ -66,8 +77,10 @@ fn load_audit_log() -> Result<AuditLog, i32> {
             keyring::account_label()
         );
     }
-    AuditLog::with_key(key).map_err(|e| {
-        eprintln!("[reli] error inicializando audit log: {e}");
+    let db_path = audit_dir.join("audit.db");
+    let anchor_dir = audit_dir.join("anchors");
+    AuditStore::open(&db_path, &anchor_dir, key).map_err(|e| {
+        eprintln!("[reli] error inicializando audit store: {e}");
         3
     })
 }
@@ -75,20 +88,21 @@ fn load_audit_log() -> Result<AuditLog, i32> {
 pub fn run() -> i32 {
     let cli = Cli::parse();
     let sandbox_path = cli.sandbox.unwrap_or_else(default_sandbox_path);
+    let audit_dir = cli.audit_dir.unwrap_or_else(default_audit_dir);
 
     match cli.command {
         Command::SandboxPath => {
             println!("{}", sandbox_path.display());
             0
         }
-        Command::Write { path, content } => run_write(&sandbox_path, &path, &content),
-        Command::Verify => run_verify_selftest(),
+        Command::Write { path, content } => run_write(&sandbox_path, &audit_dir, &path, &content),
+        Command::Verify => run_verify(&audit_dir),
     }
 }
 
-fn run_write(sandbox_path: &Path, path: &str, content: &str) -> i32 {
-    let mut audit = match load_audit_log() {
-        Ok(a) => a,
+fn run_write(sandbox_path: &Path, audit_dir: &Path, path: &str, content: &str) -> i32 {
+    let mut store = match load_audit_store(audit_dir) {
+        Ok(s) => s,
         Err(code) => return code,
     };
 
@@ -112,16 +126,16 @@ fn run_write(sandbox_path: &Path, path: &str, content: &str) -> i32 {
         },
     };
 
-    let record_hmac = match audit.record("write_file", &args, status) {
-        Ok(signed) => signed.hmac.clone(),
+    let record_hmac = match store.record("write_file", &args, status) {
+        Ok(signed) => signed.hmac,
         Err(e) => {
-            eprintln!("[reli] error registrando en el audit log: {e}");
+            eprintln!("[reli] error registrando en el audit store: {e}");
             return 3;
         }
     };
 
-    if let Err(e) = audit.verify() {
-        eprintln!("[reli] audit log corrupto tras registrar: {e}");
+    if let Err(e) = store.verify() {
+        eprintln!("[reli] audit store corrupto tras registrar: {e}");
         return 3;
     }
 
@@ -148,57 +162,19 @@ fn run_write(sandbox_path: &Path, path: &str, content: &str) -> i32 {
     }
 }
 
-fn run_verify_selftest() -> i32 {
-    let mut audit = match load_audit_log() {
-        Ok(a) => a,
+fn run_verify(audit_dir: &Path) -> i32 {
+    let store = match load_audit_store(audit_dir) {
+        Ok(s) => s,
         Err(code) => return code,
     };
-
-    let sample: [(&str, WriteFileArgs, AuditStatus); 3] = [
-        (
-            "write_file",
-            WriteFileArgs {
-                path: "a.txt",
-                bytes: 4,
-            },
-            AuditStatus::Ok,
-        ),
-        (
-            "write_file",
-            WriteFileArgs {
-                path: "b.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        ),
-        (
-            "write_file",
-            WriteFileArgs {
-                path: "../escape",
-                bytes: 0,
-            },
-            AuditStatus::Rejected {
-                reason: "PathOutsideSandbox".into(),
-            },
-        ),
-    ];
-    for (tool, args, status) in sample {
-        if let Err(e) = audit.record(tool, &args, status) {
-            eprintln!("[reli] error construyendo self-test: {e}");
-            return 3;
-        }
-    }
-
-    match audit.verify() {
+    match store.verify() {
         Ok(()) => {
             println!(
                 "[reli] verify ok: {} entradas, hmac final {}",
-                audit.len(),
-                audit.last_hmac().unwrap_or("-")
+                store.len(),
+                store.last_hmac().unwrap_or("-")
             );
-            println!(
-                "[reli] nota: v0.0.2 aún no persiste el log; este self-test vive solo en memoria."
-            );
+            println!("[reli] db: {}", store.db_path().display());
             0
         }
         Err(e) => {

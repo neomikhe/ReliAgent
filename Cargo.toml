@@ -1,6 +1,6 @@
 [package]
 name = "reliagent"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Kernel de políticas verificables para agentes de IA locales (Research Preview)"
 license = "Apache-2.0"
@@ -22,9 +22,11 @@ serde_json = "1"
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 getrandom = "0.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+proptest = "1"
 
 [profile.release]
 lto = true

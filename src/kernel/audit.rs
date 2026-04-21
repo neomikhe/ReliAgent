@@ -42,6 +42,7 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
+    #[allow(dead_code)]
     pub fn with_key(key: Vec<u8>) -> KernelResult<Self> {
         if key.len() != HMAC_KEY_LEN {
             return Err(KernelError::Audit(format!(
@@ -158,6 +159,32 @@ impl AuditLog {
         self.entries.last().map(|s| s.hmac.as_str())
     }
 
+    pub fn entry_hmac_at(&self, sequence_no: u64) -> Option<&str> {
+        let idx: usize = sequence_no.try_into().ok()?;
+        self.entries.get(idx).map(|s| s.hmac.as_str())
+    }
+
+    /// Construye un log a partir de entradas ya persistidas. No recomputa HMACs:
+    /// el llamador debe llamar a `verify()` inmediatamente después para validar.
+    pub fn from_persisted(entries: Vec<SignedEntry>, key: Vec<u8>) -> KernelResult<Self> {
+        if key.len() != HMAC_KEY_LEN {
+            return Err(KernelError::Audit(format!(
+                "HMAC key length {} != expected {}",
+                key.len(),
+                HMAC_KEY_LEN
+            )));
+        }
+        Ok(Self { entries, key })
+    }
+
+    /// Elimina la última entrada del log. Usado por el store para rollback si
+    /// el INSERT en SQLite falla después de `record`.
+    pub(super) fn rollback_last(&mut self) -> KernelResult<SignedEntry> {
+        self.entries
+            .pop()
+            .ok_or_else(|| KernelError::Audit("rollback on empty log".into()))
+    }
+
     #[cfg(test)]
     pub(super) fn entries_mut(&mut self) -> &mut Vec<SignedEntry> {
         &mut self.entries
@@ -166,6 +193,12 @@ impl AuditLog {
     #[cfg(test)]
     pub(super) fn with_state_for_test(entries: Vec<SignedEntry>, key: Vec<u8>) -> Self {
         Self { entries, key }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(super) fn last_entry(&self) -> Option<&SignedEntry> {
+        self.entries.last()
     }
 }
 

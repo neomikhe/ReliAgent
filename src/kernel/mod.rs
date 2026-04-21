@@ -1,7 +1,9 @@
+pub mod anchor;
 pub mod audit;
 pub mod keyring;
 pub mod policy;
 pub mod sandbox;
+pub mod store;
 pub mod tools;
 
 use std::io;
