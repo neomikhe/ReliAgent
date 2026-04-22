@@ -1,0 +1,19 @@
+# Canonical model manifest — ReliAgent v0.1.0
+#
+# One line per canonical artifact:
+#
+#     <sha256 hex>  <filename>  <bytes>  <license-url>
+#
+# Fields are separated by two spaces. Lines starting with "#" are comments.
+# The fetch_model.{sh,ps1} scripts parse only lines whose first field is a
+# 64-char hex digest.
+#
+# IMPORTANT — placeholder file.
+# The SHA-256 values below MUST be replaced with the real digest of the
+# exact GGUF file served by the mirror before cutting a public release.
+# Leaving them as "REPLACE_..." will cause fetch_model to refuse every
+# download, which is the correct failure mode.
+
+REPLACE_WITH_SHA256_64HEX_FOR_Q4_K_M  qwen2.5-7b-instruct-q4_k_m.gguf  0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE
+REPLACE_WITH_SHA256_64HEX_FOR_Q5_K_M  qwen2.5-7b-instruct-q5_k_m.gguf  0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE
+REPLACE_WITH_SHA256_64HEX_FOR_Q8_0    qwen2.5-7b-instruct-q8_0.gguf    0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE

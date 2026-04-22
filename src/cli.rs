@@ -29,7 +29,7 @@ const EXIT_TIMEOUT: i32 = 5;
 #[command(
     name = "reli",
     version,
-    about = "ReliAgent Trust Kernel (v0.0.5 — kernel + audit + orquestador + aprobación TTY)"
+    about = "ReliAgent Trust Kernel (v0.1.0 Research Preview — kernel + audit + orquestador + aprobación TTY)"
 )]
 struct Cli {
     /// Ruta raíz del sandbox. Por defecto: ~/ReliAgent_Sandbox

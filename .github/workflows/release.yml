@@ -1,0 +1,187 @@
+# ReliAgent — release workflow
+#
+# Trigger: pushing a tag matching v*.*.* (e.g. v0.1.0).
+#
+# What it does (per platform):
+#   1. Build the `reli` binary with the pinned Rust toolchain.
+#   2. Run unit, integration, and red-team tests.
+#   3. Generate an SBOM with Syft (SPDX + CycloneDX).
+#   4. Keyless-sign every released artifact with cosign via GitHub OIDC.
+#   5. Upload the binary, SBOMs, and detached signatures to the GitHub
+#      release.
+#
+# Verification (for end users):
+#   cosign verify-blob \
+#       --certificate reli.cert \
+#       --signature   reli.sig  \
+#       --certificate-identity-regexp 'https://github\.com/<org>/reliagent/\.github/workflows/release\.yml@refs/tags/v.*' \
+#       --certificate-oidc-issuer      'https://token.actions.githubusercontent.com' \
+#       reli
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write     # create/update releases
+  id-token: write     # cosign keyless OIDC
+  attestations: write # GitHub attestation API
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary: reli
+            archive: reli-${{ github.ref_name }}-linux-x86_64.tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            binary: reli
+            archive: reli-${{ github.ref_name }}-macos-aarch64.tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary: reli.exe
+            archive: reli-${{ github.ref_name }}-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.0'
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: fmt + clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --release --target ${{ matrix.target }} -- -D warnings
+
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: unit + integration + red-team tests
+        run: |
+          cargo test --release --locked --target ${{ matrix.target }}
+          cargo test --release --locked --target ${{ matrix.target }} --test red_team
+
+      - name: stage artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          cp README.md LICENSE SECURITY.md KNOWN_ISSUES.md dist/ || true
+          cp -r docs dist/docs || true
+
+      - name: package
+        shell: bash
+        run: |
+          cd dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+              7z a -tzip ../${{ matrix.archive }} .
+          else
+              tar -czf ../${{ matrix.archive }} .
+          fi
+
+      - name: generate SBOM (SPDX + CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./
+          format: spdx-json
+          output-file: ${{ matrix.archive }}.spdx.json
+
+      - name: generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ./
+          format: cyclonedx-json
+          output-file: ${{ matrix.archive }}.cdx.json
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign sign artifact (keyless OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        shell: bash
+        run: |
+          cosign sign-blob --yes \
+              --output-certificate ${{ matrix.archive }}.cert \
+              --output-signature   ${{ matrix.archive }}.sig  \
+              ${{ matrix.archive }}
+          cosign sign-blob --yes \
+              --output-certificate ${{ matrix.archive }}.spdx.json.cert \
+              --output-signature   ${{ matrix.archive }}.spdx.json.sig  \
+              ${{ matrix.archive }}.spdx.json
+          cosign sign-blob --yes \
+              --output-certificate ${{ matrix.archive }}.cdx.json.cert \
+              --output-signature   ${{ matrix.archive }}.cdx.json.sig  \
+              ${{ matrix.archive }}.cdx.json
+
+      - name: GitHub build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: ${{ matrix.archive }}
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.cert
+            ${{ matrix.archive }}.sig
+            ${{ matrix.archive }}.spdx.json
+            ${{ matrix.archive }}.spdx.json.cert
+            ${{ matrix.archive }}.spdx.json.sig
+            ${{ matrix.archive }}.cdx.json
+            ${{ matrix.archive }}.cdx.json.cert
+            ${{ matrix.archive }}.cdx.json.sig
+          fail_on_unmatched_files: true
+          draft: true
+
+  verification-notes:
+    name: release notes draft
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: write verification instructions
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          body: |
+            ## Verifying this release
+
+            Every artifact is signed with [cosign](https://github.com/sigstore/cosign)
+            using GitHub OIDC (no long-lived keys). To verify:
+
+            ```bash
+            cosign verify-blob \
+                --certificate reli-${{ github.ref_name }}-<platform>.tar.gz.cert \
+                --signature   reli-${{ github.ref_name }}-<platform>.tar.gz.sig  \
+                --certificate-identity-regexp 'https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v.*' \
+                --certificate-oidc-issuer      'https://token.actions.githubusercontent.com' \
+                reli-${{ github.ref_name }}-<platform>.tar.gz
+            ```
+
+            The `*.spdx.json` and `*.cdx.json` files are the Software Bill of
+            Materials in SPDX and CycloneDX formats respectively, each with its
+            own signature pair.
+
+            See [`docs/THREAT_MODEL.md`](../blob/${{ github.ref_name }}/docs/THREAT_MODEL.md)
+            and [`KNOWN_ISSUES.md`](../blob/${{ github.ref_name }}/KNOWN_ISSUES.md)
+            before deploying.

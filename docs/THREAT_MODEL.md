@@ -1,0 +1,155 @@
+# Threat Model — ReliAgent v0.1.0 (Research Preview)
+
+> **Status:** Research Preview. This document describes what v0.1.0 actually
+> defends against today, not what future versions aim to achieve. Anything
+> outside the "In scope" section is **explicitly out of scope**.
+
+## Purpose
+
+ReliAgent is a local trusted kernel for AI agents: a policy engine and a
+tamper-evident audit log that sit between an LLM orchestrator and the
+user's filesystem. This document enumerates the actors, assets, attack
+vectors and mitigations we considered while building v0.1.0, and is linked
+from every user-facing doc that makes a security claim.
+
+If ReliAgent's behaviour ever contradicts this document, the contradiction
+is a bug. Open an issue against this file in the same PR.
+
+---
+
+## 1. Actors
+
+| # | Actor | Capability assumed | Treated as |
+|---|---|---|---|
+| 1 | **Legitimate user** | Runs the binary, approves or rejects proposals, reads the log. | Trusted. |
+| 2 | **LLM / orchestrator** | Generates proposals (tool + args). May be adversarial, hallucinating, or a victim of prompt injection via file content. | **Untrusted.** Every proposal passes the Rust policy engine before any side effect. |
+| 3 | **Offline file-system attacker** | Can read and modify files on disk (the SQLite DB, the sandbox, `anchor.log`) but does **not** have code execution as the user and cannot read the OS keyring. | Partially mitigated (see §4). |
+| 4 | **Process running as the user** | Can read the keyring, `ptrace`, dump memory, replace the binary on disk. | **Out of scope.** If an attacker already executes code as the user, the kernel cannot defend against them. |
+| 5 | **Compromised dependency** | A malicious crate, a malicious Ollama build, a model file swapped after download. | Partially mitigated (pinned versions, SHA256 model pinning, SBOM at release). Residual risk documented. |
+| 6 | **Physical attacker** | Cold-boot, DMA, evil-maid, TPM attacks. | **Out of scope.** |
+
+---
+
+## 2. Assets
+
+| # | Asset | Protection |
+|---|---|---|
+| A | Files **outside** the sandbox root (`~/ReliAgent_Sandbox/`). | Writes forbidden by default; path validation + `cap-std` capability. Reads follow the same rule (v0.2 will add an opt-in read allowlist with per-file approval). |
+| B | Integrity of the action log. | Linear HMAC-SHA256 chain over every recorded entry; `anchor.log` as external witness against truncation. |
+| C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, libsecret on Linux). Never written to disk in plaintext, never logged. |
+| D | Approval gate. | TTY prompt before any mutating proposal executes. In non-interactive mode or without a TTY, the default is **reject**. |
+| E | Privacy of the user. | Zero outbound network traffic from `reli` itself. The Python sidecar talks to Ollama on `localhost:11434` only. Model downloads are explicit, interactive, and optional. |
+
+---
+
+## 3. Vectors and mitigations
+
+All vectors below are exercised by `tests/red_team.rs`. Mitigations live in
+deterministic Rust code — the LLM critic is a second layer only and
+**cannot** approve anything the engine rejected.
+
+### 3.1 Path-based attacks
+
+| Vector | Mitigation |
+|---|---|
+| `..` traversal (`../../etc/passwd`) | `validate_write_path` rejects any `ParentDir` component before I/O. |
+| Unicode homoglyph pseudo-traversal (`．．/…`) | Fullwidth dots are not parsed as `ParentDir`; the segment becomes a literal directory name inside the sandbox. Escape cannot succeed. |
+| Absolute path (`/etc/…`, `C:\…`) | Rejected as `PathOutsideSandbox`. Windows drive-relative forms (`C:foo`) are rejected before normalization. |
+| Windows extended-length prefix `\\?\` or device prefix `\\.\` | Rejected as `InvalidPath`. |
+| NTFS alternate data streams (`file.txt:hidden`) | Any `:` in the filename segment on Windows is rejected. |
+| Null byte injection (`foo.txt\0.jpg`) | Rejected as `InvalidPath`. |
+| Empty components collapsing to `..` (`foo//../bar`) | `Path::components` still emits `ParentDir`; rejected. |
+| Symlink-swap TOCTOU | `cap-std` opens every file through the sandbox capability; it does not follow symlinks that escape the root. |
+
+### 3.2 Content-based attacks
+
+| Vector | Mitigation |
+|---|---|
+| Oversized write (> 10 MiB) | `write_file` checks size **before** opening any file handle; returns `FileTooLarge`. |
+| Prompt injection via file content (`IGNORE PREVIOUS INSTRUCTIONS…`) | `read_file` / `list_dir` return bytes. The kernel never interprets file content as instructions. Interpretation (if any) happens in the Python orchestrator, which has no ability to bypass the kernel's policy. |
+| CRLF / control characters in tool arguments | JSON serialisation escapes them; they become opaque string bytes inside the `args_hash`. One entry in, one entry out. |
+| Deeply nested JSON as tool args (DoS) | `serde_json` has a default recursion limit; reasonable depths record and verify without panic. |
+
+### 3.3 Audit log attacks
+
+| Vector | Mitigation |
+|---|---|
+| HMAC byte flip in the DB | Every entry recomputes HMAC-SHA256 on `open`. Byte-flip tests exhaust all 32 bytes of every test entry. |
+| `prev_hmac` tampering (broken chain link) | `verify()` walks the chain; mismatch aborts open with `AuditCorrupted`. |
+| Intermediate row deletion | `sequence_no` contiguity check catches the gap. |
+| Tail truncation (delete the last row) | In-DB chain alone cannot detect this; `anchor.log` records a witness outside the DB and flags the mismatch on open. |
+| Replay: insert a duplicate `sequence_no` | SQLite `UNIQUE` / `PRIMARY KEY` constraint rejects it at INSERT time; even if injected via raw SQL, the chain re-verification fails. |
+| Clock rollback or past-timestamp forgery | Timestamp is inside the HMAC input; any change breaks the chain. Ordering is enforced by `sequence_no`, not the clock. |
+| Wrong HMAC key on reopen (including deleted keyring entry) | Re-verification fails with `AuditCorrupted`. |
+
+### 3.4 Orchestration / approval attacks
+
+| Vector | Mitigation |
+|---|---|
+| Non-interactive run silently auto-approving | Default in non-TTY / `--non-interactive` mode is **reject**. |
+| Stalled operator blocking a batch | 60-second timeout; on expiry the proposal is rejected, not approved. |
+| Orchestrator forging a proposal as "already approved" | The Rust kernel owns the approval gate; the Python side can only *propose*. |
+| LLM critic "approving" a rule-violating action | The critic is architecturally downstream of the policy engine and can only reject further. A critic approval never overrides a hard-rule rejection. |
+
+---
+
+## 4. Residual risk
+
+These are things ReliAgent v0.1.0 does **not** fully defend against.
+They are documented here so no user is surprised.
+
+- **Code execution as the user.** If an attacker runs arbitrary code as the
+  user account, they can read the keyring, decrypt or forge log entries,
+  replace the binary on disk, or intercept TTY approvals. This is the
+  classic threat-model boundary of a user-space trusted kernel.
+- **Supply-chain compromise.** A malicious Rust crate, Python wheel, or
+  Ollama binary can undermine everything above. Mitigations: pinned
+  versions, `cargo --locked` in CI, SBOM + `cosign` signature on releases
+  (tracked in §6 and the release workflow).
+- **Side channels on the keyring.** Memory scraping, debugger attach,
+  weaknesses in the OS keyring implementation itself.
+- **Linux without libsecret.** Fallback to a local encrypted file is a
+  strict downgrade versus a native keyring. Documented in
+  `KNOWN_ISSUES.md`.
+- **Antivirus / Windows Defender touching the sandbox.** An AV tool that
+  rewrites or quarantines a sandboxed file can make the HMAC chain report
+  tampering — a *true* positive against the file, but a false positive
+  against the user. Mitigation: recommend an AV exclusion in docs; never
+  silently "fix" the chain.
+- **SHA-256 collision resistance.** Treated as cryptographically sound in
+  2026; a break in SHA-256 would invalidate the chain.
+
+---
+
+## 5. Out of scope (by policy)
+
+- Root / administrator privilege escalation.
+- Physical attacks (cold-boot, DMA, evil-maid, TPM bypass if no TPM is
+  configured).
+- Malicious behaviour inside the user's own legitimate process tree.
+- Non-audited Ollama or model versions. Each release pins an Ollama
+  version it was tested against; newer versions ship at the user's risk
+  until re-audited.
+- Bugs in CPython, Rust stdlib, or `rusqlite` / `cap-std` / `hmac` /
+  `sha2`. These are treated as trusted computing base.
+
+---
+
+## 6. Change control
+
+- This file is part of the repository and versioned alongside the code.
+- Any PR that weakens a guarantee here must update this file in the same
+  commit, with rationale.
+- `hash_format_version` is pinned at `1` for v0.1.0. Any change to the
+  fields covered by HMAC or the serialisation order requires bumping it
+  and writing a migration. See [`HASH_FORMAT.md`](HASH_FORMAT.md).
+
+---
+
+## 7. Related documents
+
+- [`HASH_FORMAT.md`](HASH_FORMAT.md) — byte-level spec of the audit entry
+  and its HMAC.
+- [`../SECURITY.md`](../SECURITY.md) — how to report a vulnerability.
+- [`../KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) — platform-specific caveats.
+- `tests/red_team.rs` — the executable version of §3.
