@@ -37,3 +37,16 @@ pub fn load_or_create_audit_key() -> KernelResult<(Vec<u8>, bool)> {
 pub fn account_label() -> String {
     format!("{SERVICE}/{ACCOUNT}")
 }
+
+/// Remove the stored HMAC key, if any. Returns Ok(true) if an entry was
+/// deleted, Ok(false) if there was nothing to delete. Used by
+/// `reli reset --wipe-everything`.
+pub fn delete_audit_key() -> KernelResult<bool> {
+    let entry = keyring::Entry::new(SERVICE, ACCOUNT)
+        .map_err(|e| KernelError::Keyring(format!("open entry: {e}")))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(e) => Err(KernelError::Keyring(format!("delete keyring entry: {e}"))),
+    }
+}

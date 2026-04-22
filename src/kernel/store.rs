@@ -110,6 +110,10 @@ impl AuditStore {
         self.log.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.log.len() == 0
+    }
+
     pub fn last_hmac(&self) -> Option<&str> {
         self.log.last_hmac()
     }

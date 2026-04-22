@@ -235,3 +235,5 @@ PROJECT_CONTEXT.md
 #/target
 
 .claude/
+
+.gitignore

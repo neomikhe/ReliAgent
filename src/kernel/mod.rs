@@ -30,6 +30,9 @@ pub enum KernelError {
 
     #[error("keyring error: {0}")]
     Keyring(String),
+
+    #[error("bridge error: {0}")]
+    Bridge(String),
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;
