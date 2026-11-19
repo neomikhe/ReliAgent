@@ -4,26 +4,29 @@ use std::path::{Path, PathBuf};
 
 use reliagent::approval::{self, ApprovalDecision, ApprovalMode};
 use reliagent::bridge::{AgentRunResult, Bridge, LlmBackend, SidecarSpec, rpc_codes};
-use reliagent::kernel::audit::AuditStatus;
+use reliagent::kernel::audit::{AuditStatus, SignedEntry};
 use reliagent::kernel::keyring;
+use reliagent::kernel::policy::{MAX_FILE_SIZE, validate_write_path};
 use reliagent::kernel::sandbox::Sandbox;
-use reliagent::kernel::store::AuditStore;
+use reliagent::kernel::store::{AuditStore, LogLock};
 use reliagent::kernel::tools::{DirEntry, DirEntryKind};
-use reliagent::kernel::{KernelError, tools};
+use reliagent::kernel::{KernelError, KernelResult, tools};
 
 /// Exit codes (documented contract — changing these breaks scripts).
 /// 0 success
 /// 1 policy/agent/user rejected
 /// 2 malformed input / unsupported proposal
-/// 3 audit or keyring failure
+/// 3 audit or keyring failure (incl. a log that fails verification)
 /// 4 bridge / sidecar failure
 /// 5 approval timeout
+/// 6 audit log in use by another process (not a sign of tampering)
 const EXIT_OK: i32 = 0;
 const EXIT_REJECTED: i32 = 1;
 const EXIT_BAD_INPUT: i32 = 2;
 const EXIT_AUDIT: i32 = 3;
 const EXIT_BRIDGE: i32 = 4;
 const EXIT_TIMEOUT: i32 = 5;
+const EXIT_BUSY: i32 = 6;
 
 #[derive(Parser)]
 #[command(
@@ -161,7 +164,7 @@ fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     let (key, created) = match keyring::load_or_create_audit_key() {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("[reli] error al acceder al keyring: {e}");
+            eprintln!("[reli] error al acceder al keyring: {}", error_text(&e));
             return Err(EXIT_AUDIT);
         }
     };
@@ -173,10 +176,27 @@ fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     }
     let db_path = audit_dir.join("audit.db");
     let anchor_dir = audit_dir.join("anchors");
-    AuditStore::open(&db_path, &anchor_dir, key).map_err(|e| {
-        eprintln!("[reli] error inicializando audit store: {e}");
-        EXIT_AUDIT
+    let opened = keyring::KeyringHead::for_log(&db_path)
+        .and_then(|head| AuditStore::open_with_head(&db_path, &anchor_dir, key, Box::new(head)));
+    opened.map_err(|e| {
+        // El texto puede venir del propio archivo (manipulado): se sanea.
+        eprintln!("[reli] error inicializando audit store: {}", error_text(&e));
+        if matches!(e, KernelError::AuditCorrupted { .. }) {
+            eprintln!(
+                "[reli] el log no supera la verificación; si borraste ~/.reliagent a mano, \
+                 usa `reli reset --wipe-everything`"
+            );
+        }
+        store_error_exit(&e)
     })
+}
+
+/// Código de salida de un error al abrir o usar el log.
+fn store_error_exit(e: &KernelError) -> i32 {
+    match e {
+        KernelError::AuditBusy => EXIT_BUSY,
+        _ => EXIT_AUDIT,
+    }
 }
 
 fn open_sandbox(sandbox_path: &Path) -> Result<Sandbox, i32> {
@@ -210,9 +230,26 @@ pub fn run() -> i32 {
             }
             SandboxAction::Status => run_sandbox_status(&sandbox_path, &audit_dir),
         },
-        Command::Write { path, content } => run_write(&sandbox_path, &audit_dir, &path, &content),
-        Command::Read { path } => run_read(&sandbox_path, &audit_dir, &path),
-        Command::Ls { path } => run_ls(&sandbox_path, &audit_dir, path.as_deref().unwrap_or("")),
+        // Órdenes directas del usuario: la propia orden es la aprobación.
+        Command::Write { path, content } => run_action(
+            &sandbox_path,
+            &audit_dir,
+            &Action::Write { path, content },
+            || ApprovalDecision::Approved,
+        ),
+        Command::Read { path } => {
+            run_action(&sandbox_path, &audit_dir, &Action::Read { path }, || {
+                ApprovalDecision::Approved
+            })
+        }
+        Command::Ls { path } => run_action(
+            &sandbox_path,
+            &audit_dir,
+            &Action::List {
+                path: path.unwrap_or_default(),
+            },
+            || ApprovalDecision::Approved,
+        ),
         Command::Verify => run_verify(&audit_dir),
         Command::Reset {
             wipe_everything,
@@ -281,10 +318,21 @@ fn run_ping(python: &Path, python_cwd: &Path) -> i32 {
 /// que nadie pueda borrar la pantalla, falsificar mensajes, crear enlaces
 /// OSC 8 o escribir en el portapapeles (OSC 52).
 fn sanitize_for_terminal(s: &str) -> String {
+    escape_unsafe_chars(s, &[])
+}
+
+/// Contenido de un archivo para mostrarlo en una terminal: conserva saltos
+/// de línea y tabuladores, escapa el resto de controles (incluido `\r`, que
+/// permitiría sobrescribir la línea) y sustituye bytes que no son UTF-8.
+fn display_safe(bytes: &[u8]) -> String {
+    escape_unsafe_chars(&String::from_utf8_lossy(bytes), &['\n', '\t'])
+}
+
+fn escape_unsafe_chars(s: &str, keep: &[char]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let unsafe_char = c.is_control()
+        let unsafe_char = (c.is_control() && !keep.contains(&c))
             || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
         if unsafe_char {
             let _ = write!(out, "\\u{{{:x}}}", c as u32);
@@ -401,26 +449,21 @@ fn run_agent(
             return EXIT_BAD_INPUT;
         }
     };
+    let action = match parse_proposal(proposal) {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("[reli] {}", sanitize_for_terminal(&msg));
+            return EXIT_BAD_INPUT;
+        }
+    };
 
-    // Final TTY approval gate (or auto-reject in non-interactive mode).
+    // La propuesta queda registrada como `pending` antes de pedir la
+    // aprobación final por TTY (o rechazarla en modo non-interactive).
     let summary = render_proposal_summary(proposal, &result);
-    match approval::request_approval(&summary, approval_mode(non_interactive)) {
-        ApprovalDecision::Approved => {}
-        ApprovalDecision::Rejected => {
-            println!("[reli] usuario rechazó la propuesta — no se ejecuta");
-            return EXIT_REJECTED;
-        }
-        ApprovalDecision::AutoRejected => {
-            println!("[reli] modo non-interactive — propuesta no ejecutada");
-            return EXIT_REJECTED;
-        }
-        ApprovalDecision::Timeout => {
-            println!("[reli] timeout de aprobación — no se ejecuta");
-            return EXIT_TIMEOUT;
-        }
-    }
-
-    execute_proposal(sandbox_path, audit_dir, proposal)
+    let mode = approval_mode(non_interactive);
+    run_action(sandbox_path, audit_dir, &action, || {
+        approval::request_approval(&summary, mode)
+    })
 }
 
 /// Líneas a mostrar del resultado del agente, ya saneadas.
@@ -456,214 +499,340 @@ fn render_proposal_summary(proposal: &serde_json::Value, result: &AgentRunResult
     )
 }
 
-fn execute_proposal(sandbox_path: &Path, audit_dir: &Path, proposal: &serde_json::Value) -> i32 {
-    let tool = proposal.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    let args = match proposal.get("args").and_then(|v| v.as_object()) {
-        Some(a) => a,
-        None => {
-            eprintln!("[reli] propuesta sin args");
-            return EXIT_BAD_INPUT;
-        }
-    };
-    let path = match args.get("path").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => {
-            eprintln!("[reli] propuesta sin args.path");
-            return EXIT_BAD_INPUT;
-        }
-    };
+/// Acción del kernel, venga de la CLI (`reli write/read/ls`) o de una
+/// propuesta del agente ya validada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Action {
+    Write { path: String, content: String },
+    Read { path: String },
+    List { path: String },
+}
 
+/// Argumentos que se registran (y hashean) en el log. Mismas formas que
+/// antes de la fase 2, para que el `args_hash` de una acción no cambie.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum AuditArgs<'a> {
+    Write(WriteFileArgs<'a>),
+    Read(ReadFileArgs<'a>),
+    List(ListDirArgs<'a>),
+}
+
+impl Action {
+    fn tool(&self) -> &'static str {
+        match self {
+            Action::Write { .. } => "write_file",
+            Action::Read { .. } => "read_file",
+            Action::List { .. } => "list_dir",
+        }
+    }
+
+    fn audit_args(&self) -> AuditArgs<'_> {
+        match self {
+            Action::Write { path, content } => AuditArgs::Write(WriteFileArgs {
+                path,
+                bytes: content.len(),
+            }),
+            Action::Read { path } => AuditArgs::Read(ReadFileArgs { path }),
+            Action::List { path } => AuditArgs::List(ListDirArgs {
+                path: if path.is_empty() { "." } else { path },
+            }),
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Action::Write { path, .. } | Action::Read { path } | Action::List { path } => path,
+        }
+    }
+}
+
+/// Resultado de una acción ejecutada con éxito.
+#[derive(Debug)]
+enum Executed {
+    Wrote(usize),
+    ReadBytes(Vec<u8>),
+    Listed(Vec<DirEntry>),
+}
+
+/// Por qué una acción no se completó.
+#[derive(Debug)]
+enum Refusal {
+    /// No hubo aprobación (usuario, timeout o modo non-interactive).
+    Approval(ApprovalDecision),
+    /// El kernel la rechazó (política) o falló al ejecutarla (E/S).
+    Kernel(KernelError),
+}
+
+/// Convierte la propuesta del sidecar en una `Action`. No ejecuta nada.
+fn parse_proposal(proposal: &serde_json::Value) -> Result<Action, String> {
+    let tool = proposal.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+    let args = proposal
+        .get("args")
+        .and_then(|v| v.as_object())
+        .ok_or("propuesta sin args")?;
+    let path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or("propuesta sin args.path")?
+        .to_string();
     match tool {
         "write_file" => {
-            let content = match args.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.to_string(),
-                None => {
-                    eprintln!("[reli] propuesta write_file sin args.content");
-                    return EXIT_BAD_INPUT;
-                }
-            };
-            run_write(sandbox_path, audit_dir, &path, &content)
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or("propuesta write_file sin args.content")?
+                .to_string();
+            Ok(Action::Write { path, content })
         }
-        "read_file" => run_read(sandbox_path, audit_dir, &path),
-        "list_dir" => run_ls(sandbox_path, audit_dir, &path),
-        other => {
-            eprintln!("[reli] propuesta con tool no soportado: {other:?}");
-            EXIT_BAD_INPUT
-        }
+        "read_file" => Ok(Action::Read { path }),
+        "list_dir" => Ok(Action::List { path }),
+        other => Err(format!("propuesta con tool no soportado: {other:?}")),
     }
 }
 
-fn kernel_error_exit(e: &KernelError) -> i32 {
-    match e {
+/// Motivo registrado cuando no hay aprobación.
+fn approval_reason(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Approved => "approved",
+        ApprovalDecision::Rejected => "user_denied",
+        ApprovalDecision::Timeout => "timeout",
+        ApprovalDecision::AutoRejected => "non_interactive",
+    }
+}
+
+fn is_policy_rejection(e: &KernelError) -> bool {
+    matches!(
+        e,
         KernelError::PathOutsideSandbox { .. }
-        | KernelError::InvalidPath { .. }
-        | KernelError::FileTooLarge { .. } => EXIT_REJECTED,
-        _ => EXIT_BAD_INPUT,
+            | KernelError::InvalidPath { .. }
+            | KernelError::FileTooLarge { .. }
+    )
+}
+
+/// Motivo que se guarda en el log. Nunca incluye la ruta ni texto del SO:
+/// los argumentos solo constan como `args_hash`, y la ruta la puede elegir
+/// el LLM.
+fn audit_reason(e: &KernelError) -> String {
+    match e {
+        KernelError::PathOutsideSandbox { .. } => "policy: path_outside_sandbox".into(),
+        // Los motivos de InvalidPath son textos fijos del kernel.
+        KernelError::InvalidPath { reason } => format!("policy: invalid_path ({reason})"),
+        KernelError::FileTooLarge { actual, max } => {
+            format!("policy: file_too_large ({actual} > {max} bytes)")
+        }
+        KernelError::Io(io) => format!("io: {:?}", io.kind()),
+        _ => "error: unexpected kernel error".into(),
     }
 }
 
-fn run_write(sandbox_path: &Path, audit_dir: &Path, path: &str, content: &str) -> i32 {
+fn refusal_status(e: &KernelError) -> AuditStatus {
+    let reason = audit_reason(e);
+    if is_policy_rejection(e) {
+        AuditStatus::Rejected { reason }
+    } else {
+        AuditStatus::Error { reason }
+    }
+}
+
+/// Reglas del motor de políticas que no dependen del disco. Se evalúan
+/// antes de preguntar al humano (las herramientas las repiten al ejecutar).
+fn precheck(action: &Action) -> KernelResult<()> {
+    match action {
+        Action::Write { path, content } => {
+            if content.len() > MAX_FILE_SIZE {
+                return Err(KernelError::FileTooLarge {
+                    actual: content.len(),
+                    max: MAX_FILE_SIZE,
+                });
+            }
+            validate_write_path(path).map(|_| ())
+        }
+        Action::Read { path } => validate_write_path(path).map(|_| ()),
+        Action::List { path } if path.is_empty() || path == "." => Ok(()),
+        Action::List { path } => validate_write_path(path).map(|_| ()),
+    }
+}
+
+fn perform(sandbox: &Sandbox, action: &Action) -> KernelResult<Executed> {
+    match action {
+        Action::Write { path, content } => tools::write_file(sandbox, path, content.as_bytes())
+            .map(|()| Executed::Wrote(content.len())),
+        Action::Read { path } => tools::read_file(sandbox, path).map(Executed::ReadBytes),
+        Action::List { path } => tools::list_dir(sandbox, path).map(Executed::Listed),
+    }
+}
+
+/// Núcleo auditado: `pending` → política → aprobación → ejecución →
+/// resolución. Todo lo que va dentro del closure ocurre solo si el
+/// `pending` ya está persistido (garantía de `AuditStore::run_audited`).
+fn execute_audited(
+    store: &mut AuditStore,
+    sandbox: &Sandbox,
+    action: &Action,
+    approve: impl FnOnce() -> ApprovalDecision,
+) -> KernelResult<(Result<Executed, Refusal>, SignedEntry)> {
+    store.run_audited(action.tool(), &action.audit_args(), || {
+        // El motor de políticas va antes que el humano: así una propuesta
+        // que intenta salir del sandbox consta como tal, no como
+        // `user_denied`, y nadie tiene que decidir sobre ella.
+        if let Err(e) = precheck(action) {
+            let status = refusal_status(&e);
+            return (Err(Refusal::Kernel(e)), status);
+        }
+        let decision = approve();
+        if decision != ApprovalDecision::Approved {
+            let status = AuditStatus::Rejected {
+                reason: approval_reason(decision).into(),
+            };
+            return (Err(Refusal::Approval(decision)), status);
+        }
+        match perform(sandbox, action) {
+            Ok(done) => (Ok(done), AuditStatus::Ok),
+            Err(e) => {
+                let status = refusal_status(&e);
+                (Err(Refusal::Kernel(e)), status)
+            }
+        }
+    })
+}
+
+/// Abre el log y el sandbox, ejecuta la acción auditada e informa.
+fn run_action(
+    sandbox_path: &Path,
+    audit_dir: &Path,
+    action: &Action,
+    approve: impl FnOnce() -> ApprovalDecision,
+) -> i32 {
     let mut store = match load_audit_store(audit_dir) {
         Ok(s) => s,
         Err(code) => return code,
     };
-
     let sandbox = match open_sandbox(sandbox_path) {
         Ok(s) => s,
         Err(code) => return code,
     };
-
-    let args = WriteFileArgs {
-        path,
-        bytes: content.len(),
-    };
-    let result = tools::write_file(&sandbox, path, content.as_bytes());
-    let status = match &result {
-        Ok(()) => AuditStatus::Ok,
-        Err(e) => AuditStatus::Rejected {
-            reason: format!("{e}"),
-        },
-    };
-
-    let record_hmac = match store.record("write_file", &args, status) {
-        Ok(signed) => signed.hmac,
-        Err(e) => {
-            eprintln!("[reli] error registrando en el audit store: {e}");
-            return EXIT_AUDIT;
+    match store.resolve_orphans() {
+        Ok(closed) => {
+            for orphan in &closed {
+                eprintln!(
+                    "[reli] seq {} ({}, {}) quedó sin resultado en una sesión anterior: \
+                     registrada como `abandoned` (puede que se ejecutara o no; revisa el sandbox)",
+                    orphan.sequence_no,
+                    sanitize_for_terminal(&orphan.tool),
+                    sanitize_for_terminal(&orphan.timestamp)
+                );
+            }
         }
-    };
-
-    if let Err(e) = store.verify() {
-        eprintln!("[reli] audit store corrupto tras registrar: {e}");
-        return EXIT_AUDIT;
+        Err(e) => {
+            eprintln!(
+                "[reli] error registrando en el audit store: {}",
+                error_text(&e)
+            );
+            return store_error_exit(&e);
+        }
     }
 
-    match result {
-        Ok(()) => {
+    let (result, resolution) = match execute_audited(&mut store, &sandbox, action, approve) {
+        Ok(r) => r,
+        Err(e) => {
+            // El mensaje dice si la acción llegó a ejecutarse (ver run_audited).
+            eprintln!("[reli] error del audit store: {}", error_text(&e));
+            return store_error_exit(&e);
+        }
+    };
+    if let Err(e) = store.verify() {
+        eprintln!(
+            "[reli] audit store corrupto tras registrar: {}",
+            error_text(&e)
+        );
+        return EXIT_AUDIT;
+    }
+    let hmac = resolution.hmac;
+    // Liberar el log antes de escribir en stdout: un pipe lleno no debe
+    // dejarlo bloqueado para otros procesos.
+    drop(store);
+    report(&sandbox, action, result, &hmac)
+}
+
+/// Mensajes y código de salida de una acción ya registrada.
+fn report(
+    sandbox: &Sandbox,
+    action: &Action,
+    result: Result<Executed, Refusal>,
+    hmac: &str,
+) -> i32 {
+    let path = sanitize_for_terminal(action.path());
+    // `reli write` siempre imprimió el hmac en stdout; el resto, en stderr.
+    let mut hmac_to_stdout = false;
+    let code = match result {
+        Ok(Executed::Wrote(n)) => {
+            let full = sandbox.root_path().join(action.path());
             println!(
-                "[reli] ok: {} bytes escritos en {}",
-                content.len(),
-                sanitize_for_terminal(&sandbox.root_path().join(path).display().to_string())
+                "[reli] ok: {n} bytes escritos en {}",
+                sanitize_for_terminal(&full.display().to_string())
             );
-            println!("[reli] audit hmac: {record_hmac}");
+            hmac_to_stdout = true;
             EXIT_OK
         }
-        Err(e) => {
-            eprintln!("[reli] rechazado: {}", error_text(&e));
-            eprintln!("[reli] audit hmac: {record_hmac}");
-            kernel_error_exit(&e)
-        }
-    }
-}
-
-fn run_read(sandbox_path: &Path, audit_dir: &Path, path: &str) -> i32 {
-    let mut store = match load_audit_store(audit_dir) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let sandbox = match open_sandbox(sandbox_path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    let args = ReadFileArgs { path };
-    let result = tools::read_file(&sandbox, path);
-    let status = match &result {
-        Ok(_) => AuditStatus::Ok,
-        Err(e) => AuditStatus::Rejected {
-            reason: format!("{e}"),
-        },
-    };
-
-    let record_hmac = match store.record("read_file", &args, status) {
-        Ok(signed) => signed.hmac,
-        Err(e) => {
-            eprintln!("[reli] error registrando en el audit store: {e}");
-            return EXIT_AUDIT;
-        }
-    };
-
-    if let Err(e) = store.verify() {
-        eprintln!("[reli] audit store corrupto tras registrar: {e}");
-        return EXIT_AUDIT;
-    }
-
-    match result {
-        Ok(bytes) => {
-            use std::io::Write;
-            // Write raw bytes to stdout so binary payloads survive.
-            // Human-facing status goes to stderr.
+        Ok(Executed::ReadBytes(bytes)) => {
+            use std::io::{IsTerminal, Write};
+            // A un pipe o archivo, bytes crudos (como `cat`). A una terminal,
+            // texto con los caracteres de control escapados: el contenido
+            // puede haberlo escrito el LLM. El estado va a stderr.
             let stdout = std::io::stdout();
+            let shown = if stdout.is_terminal() {
+                display_safe(&bytes).into_bytes()
+            } else {
+                bytes.clone()
+            };
             let mut handle = stdout.lock();
-            if let Err(e) = handle.write_all(&bytes) {
+            if let Err(e) = handle.write_all(&shown).and_then(|()| handle.flush()) {
                 eprintln!("[reli] error escribiendo stdout: {e}");
                 return EXIT_BAD_INPUT;
             }
-            let _ = handle.flush();
-            eprintln!(
-                "[reli] ok: {} bytes leídos de {}",
-                bytes.len(),
-                sanitize_for_terminal(path)
-            );
-            eprintln!("[reli] audit hmac: {record_hmac}");
+            eprintln!("[reli] ok: {} bytes leídos de {path}", bytes.len());
             EXIT_OK
         }
-        Err(e) => {
-            eprintln!("[reli] rechazado: {}", error_text(&e));
-            eprintln!("[reli] audit hmac: {record_hmac}");
-            kernel_error_exit(&e)
-        }
-    }
-}
-
-fn run_ls(sandbox_path: &Path, audit_dir: &Path, path: &str) -> i32 {
-    let mut store = match load_audit_store(audit_dir) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let sandbox = match open_sandbox(sandbox_path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-
-    let normalized = if path.is_empty() { "." } else { path };
-    let args = ListDirArgs { path: normalized };
-    let result = tools::list_dir(&sandbox, path);
-    let status = match &result {
-        Ok(_) => AuditStatus::Ok,
-        Err(e) => AuditStatus::Rejected {
-            reason: format!("{e}"),
-        },
-    };
-
-    let record_hmac = match store.record("list_dir", &args, status) {
-        Ok(signed) => signed.hmac,
-        Err(e) => {
-            eprintln!("[reli] error registrando en el audit store: {e}");
-            return EXIT_AUDIT;
-        }
-    };
-
-    if let Err(e) = store.verify() {
-        eprintln!("[reli] audit store corrupto tras registrar: {e}");
-        return EXIT_AUDIT;
-    }
-
-    match result {
-        Ok(entries) => {
+        Ok(Executed::Listed(entries)) => {
             for entry in &entries {
                 println!("{}", entry_line(entry));
             }
             eprintln!("[reli] ok: {} entradas", entries.len());
-            eprintln!("[reli] audit hmac: {record_hmac}");
             EXIT_OK
         }
-        Err(e) => {
-            eprintln!("[reli] rechazado: {}", error_text(&e));
-            eprintln!("[reli] audit hmac: {record_hmac}");
-            kernel_error_exit(&e)
+        Err(Refusal::Approval(decision)) => {
+            let (msg, code) = match decision {
+                ApprovalDecision::Timeout => {
+                    ("timeout de aprobación — no se ejecuta", EXIT_TIMEOUT)
+                }
+                ApprovalDecision::AutoRejected => (
+                    "modo non-interactive — propuesta no ejecutada",
+                    EXIT_REJECTED,
+                ),
+                _ => (
+                    "usuario rechazó la propuesta — no se ejecuta",
+                    EXIT_REJECTED,
+                ),
+            };
+            println!("[reli] {msg}");
+            code
         }
+        Err(Refusal::Kernel(e)) => {
+            eprintln!("[reli] rechazado: {}", error_text(&e));
+            if is_policy_rejection(&e) {
+                EXIT_REJECTED
+            } else {
+                EXIT_BAD_INPUT
+            }
+        }
+    };
+    if hmac_to_stdout {
+        println!("[reli] audit hmac: {hmac}");
+    } else {
+        eprintln!("[reli] audit hmac: {hmac}");
     }
+    code
 }
 
 fn entry_line(e: &DirEntry) -> String {
@@ -688,12 +857,24 @@ fn run_verify(audit_dir: &Path) -> i32 {
                 store.last_hmac().unwrap_or("-")
             );
             println!("[reli] db: {}", store.db_path().display());
+            print_open_actions(&store);
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] verify falló: {e}");
+            eprintln!("[reli] verify falló: {}", error_text(&e));
             EXIT_AUDIT
         }
+    }
+}
+
+/// Avisa de acciones `pending` sin resultado (p. ej. tras un crash).
+fn print_open_actions(store: &AuditStore) {
+    let open = store.unresolved_pending();
+    if !open.is_empty() {
+        println!(
+            "[reli] acciones sin resultado registrado: {open:?} — la próxima acción las \
+             registrará como `abandoned`"
+        );
     }
 }
 
@@ -722,8 +903,9 @@ fn run_sandbox_status(sandbox_path: &Path, audit_dir: &Path) -> i32 {
             );
             match store.verify() {
                 Ok(()) => println!("[reli] audit verify: ok"),
-                Err(e) => println!("[reli] audit verify: FAILED ({e})"),
+                Err(e) => println!("[reli] audit verify: FAILED ({})", error_text(&e)),
             }
+            print_open_actions(&store);
             println!("[reli] keyring:      {}", keyring::account_label());
             EXIT_OK
         }
@@ -747,7 +929,15 @@ fn run_reset(
     println!("  - sandbox:  {}", sandbox_path.display());
     println!("  - audit db: {}", audit_dir.join("audit.db").display());
     println!("  - anchors:  {}", audit_dir.join("anchors").display());
+    println!(
+        "  - backup:   {}",
+        audit_dir.join("audit.db.schema1.bak").display()
+    );
     println!("  - keyring:  {}", keyring::account_label());
+    println!(
+        "  - testigo:  {}",
+        keyring::head_label(&audit_dir.join("audit.db"))
+    );
 
     if !force {
         if non_interactive {
@@ -768,6 +958,33 @@ fn run_reset(
         }
     }
 
+    // No borrar nada mientras otro proceso usa el log (p. ej. un `reli run`
+    // esperando aprobación). Funciona aunque el log esté corrupto: no lo
+    // carga ni lo verifica.
+    let db_path = audit_dir.join("audit.db");
+    let lock = if db_path.exists() {
+        match LogLock::acquire(&db_path) {
+            Ok(lock) => Some(lock),
+            Err(KernelError::AuditBusy) => {
+                eprintln!(
+                    "[reli] {} — reset abortado, no se borró nada",
+                    error_text(&KernelError::AuditBusy)
+                );
+                return EXIT_BUSY;
+            }
+            Err(e) => {
+                // Un archivo dañado no debe impedir la recuperación.
+                eprintln!(
+                    "[reli] aviso: no se pudo bloquear audit.db ({}); se continúa",
+                    error_text(&e)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut failures = 0usize;
 
     if sandbox_path.exists() {
@@ -782,20 +999,6 @@ fn run_reset(
         println!("[reli] sandbox: no existía");
     }
 
-    let db_path = audit_dir.join("audit.db");
-    remove_if_exists(&db_path, "audit.db", &mut failures);
-    // SQLite WAL/SHM siblings, if any.
-    remove_if_exists(
-        &audit_dir.join("audit.db-wal"),
-        "audit.db-wal",
-        &mut failures,
-    );
-    remove_if_exists(
-        &audit_dir.join("audit.db-shm"),
-        "audit.db-shm",
-        &mut failures,
-    );
-
     let anchors = audit_dir.join("anchors");
     if anchors.exists() {
         match std::fs::remove_dir_all(&anchors) {
@@ -809,14 +1012,47 @@ fn run_reset(
         println!("[reli] anchors: no existían");
     }
 
+    match keyring::delete_head(&db_path) {
+        Ok(true) => println!("[reli] keyring: testigo de cabeza eliminado"),
+        Ok(false) => println!("[reli] keyring: no había testigo de cabeza"),
+        Err(e) => {
+            eprintln!(
+                "[reli] error eliminando el testigo de cabeza: {}",
+                error_text(&e)
+            );
+            failures += 1;
+        }
+    }
+
     match keyring::delete_audit_key() {
         Ok(true) => println!("[reli] keyring: clave HMAC eliminada"),
         Ok(false) => println!("[reli] keyring: no había clave almacenada"),
         Err(e) => {
-            eprintln!("[reli] error eliminando clave keyring: {e}");
+            eprintln!("[reli] error eliminando clave keyring: {}", error_text(&e));
             failures += 1;
         }
     }
+
+    // El lock se suelta justo antes de borrar la base: en Windows no se puede
+    // borrar un archivo abierto.
+    drop(lock);
+    remove_if_exists(&db_path, "audit.db", &mut failures);
+    remove_if_exists(
+        &audit_dir.join("audit.db.schema1.bak"),
+        "audit.db.schema1.bak",
+        &mut failures,
+    );
+    // SQLite WAL/SHM siblings, if any.
+    remove_if_exists(
+        &audit_dir.join("audit.db-wal"),
+        "audit.db-wal",
+        &mut failures,
+    );
+    remove_if_exists(
+        &audit_dir.join("audit.db-shm"),
+        "audit.db-shm",
+        &mut failures,
+    );
 
     if failures == 0 {
         println!("[reli] reset completo");
@@ -940,6 +1176,279 @@ mod tests {
             kind: DirEntryKind::File,
         };
         assert_terminal_safe(&entry_line(&entry));
+    }
+
+    // --- Acciones auditadas (pending antes de actuar) ----------------------
+
+    use reliagent::kernel::audit::AuditStatus;
+    use tempfile::TempDir;
+
+    struct Env {
+        _tmp: TempDir,
+        store: AuditStore,
+        sandbox: Sandbox,
+    }
+
+    fn env() -> Env {
+        let tmp = TempDir::new().unwrap();
+        let store = AuditStore::open(
+            &tmp.path().join("audit.db"),
+            &tmp.path().join("anchors"),
+            vec![0x42; 32],
+        )
+        .unwrap();
+        let sandbox = Sandbox::open(tmp.path().join("sandbox")).unwrap();
+        Env {
+            _tmp: tmp,
+            store,
+            sandbox,
+        }
+    }
+
+    fn write_action(path: &str) -> Action {
+        Action::Write {
+            path: path.into(),
+            content: "hola".into(),
+        }
+    }
+
+    fn logged(store: &AuditStore) -> Vec<(AuditStatus, Option<u64>)> {
+        store
+            .entries()
+            .iter()
+            .map(|s| (s.entry.status.clone(), s.entry.resolves))
+            .collect()
+    }
+
+    #[test]
+    fn approved_action_runs_and_is_logged_as_pending_then_ok() {
+        let mut e = env();
+        let (result, _) = execute_audited(&mut e.store, &e.sandbox, &write_action("a.txt"), || {
+            ApprovalDecision::Approved
+        })
+        .unwrap();
+        assert!(matches!(result, Ok(Executed::Wrote(4))));
+        assert!(e.sandbox.root_path().join("a.txt").exists());
+        assert_eq!(
+            logged(&e.store),
+            vec![(AuditStatus::Pending, None), (AuditStatus::Ok, Some(0))]
+        );
+    }
+
+    #[test]
+    fn refused_proposals_are_logged_and_never_executed() {
+        for (decision, reason) in [
+            (ApprovalDecision::Rejected, "user_denied"),
+            (ApprovalDecision::Timeout, "timeout"),
+            (ApprovalDecision::AutoRejected, "non_interactive"),
+        ] {
+            let mut e = env();
+            let (result, _) =
+                execute_audited(&mut e.store, &e.sandbox, &write_action("a.txt"), || {
+                    decision
+                })
+                .unwrap();
+            assert!(matches!(result, Err(Refusal::Approval(d)) if d == decision));
+            assert!(!e.sandbox.root_path().join("a.txt").exists());
+            assert_eq!(
+                logged(&e.store),
+                vec![
+                    (AuditStatus::Pending, None),
+                    (
+                        AuditStatus::Rejected {
+                            reason: reason.into()
+                        },
+                        Some(0)
+                    )
+                ],
+                "{decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_violation_is_rejected_before_asking_and_logged_without_the_path() {
+        // El motor de políticas va antes que el humano: un intento de salir
+        // del sandbox queda como `policy`, no como `user_denied`.
+        let mut e = env();
+        let (result, _) = execute_audited(
+            &mut e.store,
+            &e.sandbox,
+            &write_action("../secreto.txt"),
+            || panic!("the human must not be asked about a policy violation"),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(Refusal::Kernel(KernelError::PathOutsideSandbox { .. }))
+        ));
+        let (status, resolves) = logged(&e.store)[1].clone();
+        assert_eq!(resolves, Some(0));
+        assert_eq!(
+            status,
+            AuditStatus::Rejected {
+                reason: "policy: path_outside_sandbox".into()
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_write_is_rejected_before_asking() {
+        let mut e = env();
+        let big = Action::Write {
+            path: "big.txt".into(),
+            content: "x".repeat(reliagent::kernel::policy::MAX_FILE_SIZE + 1),
+        };
+        let (result, _) =
+            execute_audited(&mut e.store, &e.sandbox, &big, || panic!("must not ask")).unwrap();
+        assert!(matches!(
+            result,
+            Err(Refusal::Kernel(KernelError::FileTooLarge { .. }))
+        ));
+    }
+
+    #[test]
+    fn io_failure_is_logged_as_error_with_its_kind_only() {
+        let mut e = env();
+        let read = Action::Read {
+            path: "missing.txt".into(),
+        };
+        let (result, _) = execute_audited(&mut e.store, &e.sandbox, &read, || {
+            ApprovalDecision::Approved
+        })
+        .unwrap();
+        assert!(matches!(result, Err(Refusal::Kernel(KernelError::Io(_)))));
+        assert_eq!(
+            logged(&e.store)[1],
+            (
+                AuditStatus::Error {
+                    reason: "io: NotFound".into()
+                },
+                Some(0)
+            )
+        );
+    }
+
+    #[test]
+    fn approval_is_asked_only_after_the_pending_row_is_on_disk() {
+        let mut e = env();
+        let anchor = e._tmp.path().join("anchors").join("anchor.log");
+        let mut lines_when_asked = None;
+        let _ = execute_audited(&mut e.store, &e.sandbox, &write_action("a.txt"), || {
+            lines_when_asked = Some(std::fs::read_to_string(&anchor).unwrap().lines().count());
+            ApprovalDecision::Rejected
+        })
+        .unwrap();
+        assert_eq!(
+            lines_when_asked,
+            Some(1),
+            "pending row and its anchor first"
+        );
+    }
+
+    #[test]
+    fn report_maps_outcomes_to_documented_exit_codes() {
+        let e = env();
+        let act = write_action("a.txt");
+        let code = |r| report(&e.sandbox, &act, r, "h");
+        assert_eq!(code(Ok(Executed::Wrote(4))), EXIT_OK);
+        assert_eq!(code(Ok(Executed::Listed(vec![]))), EXIT_OK);
+        assert_eq!(
+            code(Err(Refusal::Approval(ApprovalDecision::Rejected))),
+            EXIT_REJECTED
+        );
+        assert_eq!(
+            code(Err(Refusal::Approval(ApprovalDecision::AutoRejected))),
+            EXIT_REJECTED
+        );
+        assert_eq!(
+            code(Err(Refusal::Approval(ApprovalDecision::Timeout))),
+            EXIT_TIMEOUT
+        );
+        assert_eq!(
+            code(Err(Refusal::Kernel(KernelError::PathOutsideSandbox {
+                path: "../x".into()
+            }))),
+            EXIT_REJECTED
+        );
+        assert_eq!(
+            code(Err(Refusal::Kernel(KernelError::Io(
+                std::io::Error::other("x")
+            )))),
+            EXIT_BAD_INPUT
+        );
+    }
+
+    #[test]
+    fn busy_log_has_its_own_exit_code() {
+        assert_eq!(store_error_exit(&KernelError::AuditBusy), EXIT_BUSY);
+        assert_eq!(
+            store_error_exit(&KernelError::AuditCorrupted {
+                sequence_no: 1,
+                reason: "x".into()
+            }),
+            EXIT_AUDIT
+        );
+        assert_ne!(EXIT_BUSY, EXIT_AUDIT);
+    }
+
+    #[test]
+    fn file_contents_shown_on_a_terminal_cannot_drive_it() {
+        let shown = display_safe(b"linea 1\n\tcon tab \x1b]52;c;aGk=\x07 y \x1b[2J\xff fin");
+        assert!(shown.contains("linea 1\n\tcon tab"), "{shown:?}");
+        assert!(
+            !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+            "{shown:?}"
+        );
+        assert!(shown.contains("\\u{1b}"), "{shown:?}");
+    }
+
+    #[test]
+    fn audit_args_keep_the_v1_shapes() {
+        // Mismos bytes que antes de la fase 2: el args_hash de una acción
+        // no cambia por el refactor.
+        let json = |a: &Action| serde_json::to_string(&a.audit_args()).unwrap();
+        assert_eq!(
+            json(&write_action("a.txt")),
+            r#"{"path":"a.txt","bytes":4}"#
+        );
+        assert_eq!(
+            json(&Action::Read {
+                path: "a.txt".into()
+            }),
+            r#"{"path":"a.txt"}"#
+        );
+        assert_eq!(
+            json(&Action::List {
+                path: String::new()
+            }),
+            r#"{"path":"."}"#
+        );
+    }
+
+    #[test]
+    fn proposals_are_parsed_into_actions() {
+        let p = |v: serde_json::Value| parse_proposal(&v);
+        assert!(matches!(
+            p(serde_json::json!({"tool": "write_file", "args": {"path": "a", "content": "x"}})),
+            Ok(Action::Write { .. })
+        ));
+        assert!(matches!(
+            p(serde_json::json!({"tool": "read_file", "args": {"path": "a"}})),
+            Ok(Action::Read { .. })
+        ));
+        assert!(matches!(
+            p(serde_json::json!({"tool": "list_dir", "args": {"path": ""}})),
+            Ok(Action::List { .. })
+        ));
+        for bad in [
+            serde_json::json!({"tool": "write_file", "args": {"path": "a"}}),
+            serde_json::json!({"tool": "read_file", "args": {}}),
+            serde_json::json!({"tool": "read_file"}),
+            serde_json::json!({"tool": "rm_rf", "args": {"path": "a"}}),
+        ] {
+            assert!(p(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     fn parse_run(args: &[&str]) -> (String, bool) {

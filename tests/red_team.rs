@@ -53,6 +53,15 @@ struct WriteArgs<'a> {
     bytes: usize,
 }
 
+/// Una acción auditada completa (fila `pending` + resolución `ok`).
+fn audited(store: &mut AuditStore, path: &str, bytes: usize) {
+    store
+        .run_audited("write_file", &WriteArgs { path, bytes }, || {
+            ((), AuditStatus::Ok)
+        })
+        .unwrap();
+}
+
 fn assert_path_rejected(raw: &str) -> KernelError {
     match validate_write_path(raw) {
         Ok(p) => panic!("vector not rejected: raw={raw:?} normalized={p:?}"),
@@ -285,22 +294,13 @@ fn v12_file_content_is_not_interpreted_as_instructions() {
 // ---------------------------------------------------------------------------
 // Vector 13 — Replay attack: duplicate sequence_no at the SQL layer.
 // The schema's UNIQUE constraint on sequence_no is the last line of defence
-// against an attacker who bypasses record() and writes raw SQL. We verify
+// against an attacker who bypasses run_audited() and writes raw SQL. We verify
 // that constraint exists and fires.
 // ---------------------------------------------------------------------------
 #[test]
 fn v13_replay_duplicate_sequence_no_rejected_by_sqlite() {
     let (tmp, mut store) = new_store();
-    store
-        .record(
-            "write_file",
-            &WriteArgs {
-                path: "a.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        )
-        .unwrap();
+    audited(&mut store, "a.txt", 1);
     let db_path = tmp.path().join("audit.db");
     drop(store);
 
@@ -319,28 +319,23 @@ fn v13_replay_duplicate_sequence_no_rejected_by_sqlite() {
             "00".repeat(32)
         ],
     );
-    assert!(res.is_err(), "duplicate sequence_no must be rejected");
+    // Debe fallar por la restricción, no por otra causa (p. ej. el lock).
+    let code = res
+        .expect_err("duplicate sequence_no must be rejected")
+        .sqlite_error_code();
+    assert_eq!(code, Some(rusqlite::ErrorCode::ConstraintViolation));
 }
 
 // ---------------------------------------------------------------------------
 // Vector 14 — Clock rollback / timestamp tampering.
-// record() uses monotonic sequence_no as the real ordering. Tampering with
+// The log uses monotonic sequence_no as the real ordering. Tampering with
 // a past timestamp in the DB must break the HMAC chain and be caught on
 // reopen.
 // ---------------------------------------------------------------------------
 #[test]
 fn v14_timestamp_tampering_detected() {
     let (tmp, mut store) = new_store();
-    store
-        .record(
-            "write_file",
-            &WriteArgs {
-                path: "a.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        )
-        .unwrap();
+    audited(&mut store, "a.txt", 1);
     let db_path = tmp.path().join("audit.db");
     let anchor_dir = tmp.path().join("anchors");
     drop(store);
@@ -384,16 +379,7 @@ fn v15_jcs_canonicalization() {
 #[test]
 fn v16_hmac_tamper_detected_on_reopen() {
     let (tmp, mut store) = new_store();
-    store
-        .record(
-            "write_file",
-            &WriteArgs {
-                path: "a.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        )
-        .unwrap();
+    audited(&mut store, "a.txt", 1);
     let db_path = tmp.path().join("audit.db");
     let anchor_dir = tmp.path().join("anchors");
     drop(store);
@@ -418,26 +404,8 @@ fn v16_hmac_tamper_detected_on_reopen() {
 #[test]
 fn v17_prev_hmac_tamper_detected() {
     let (tmp, mut store) = new_store();
-    store
-        .record(
-            "write_file",
-            &WriteArgs {
-                path: "a.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        )
-        .unwrap();
-    store
-        .record(
-            "write_file",
-            &WriteArgs {
-                path: "b.txt",
-                bytes: 1,
-            },
-            AuditStatus::Ok,
-        )
-        .unwrap();
+    audited(&mut store, "a.txt", 1);
+    audited(&mut store, "b.txt", 1);
     let db_path = tmp.path().join("audit.db");
     let anchor_dir = tmp.path().join("anchors");
     drop(store);
@@ -463,16 +431,7 @@ fn v17_prev_hmac_tamper_detected() {
 fn v18_intermediate_row_deletion_detected() {
     let (tmp, mut store) = new_store();
     for i in 0..3 {
-        store
-            .record(
-                "write_file",
-                &WriteArgs {
-                    path: "x.txt",
-                    bytes: i,
-                },
-                AuditStatus::Ok,
-            )
-            .unwrap();
+        audited(&mut store, "x.txt", i);
     }
     let db_path = tmp.path().join("audit.db");
     let anchor_dir = tmp.path().join("anchors");
@@ -530,18 +489,19 @@ fn v21_null_byte_in_path() {
 fn v22_crlf_in_args_does_not_forge_entries() {
     let (_tmp, mut store) = new_store();
     let nasty_path = "normal\r\nINJECTED\r\n";
-    let signed = store
-        .record(
+    let (_, signed) = store
+        .run_audited(
             "write_file",
             &WriteArgs {
                 path: nasty_path,
                 bytes: 0,
             },
-            AuditStatus::Ok,
+            || ((), AuditStatus::Ok),
         )
         .unwrap();
-    assert_eq!(store.len(), 1, "CRLF must not produce multiple entries");
-    assert_eq!(signed.entry.sequence_no, 0);
+    // Una acción = pending + resolución; CRLF no puede crear filas extra.
+    assert_eq!(store.len(), 2, "CRLF must not produce extra entries");
+    assert_eq!(signed.entry.sequence_no, 1);
     store.verify().unwrap();
 }
 
@@ -573,7 +533,7 @@ fn v23_deep_nested_args_do_not_panic() {
     let (_tmp, mut store) = new_store();
     let nested = build(64);
     store
-        .record("write_file", &nested, AuditStatus::Ok)
+        .run_audited("write_file", &nested, || ((), AuditStatus::Ok))
         .unwrap();
     store.verify().unwrap();
 }

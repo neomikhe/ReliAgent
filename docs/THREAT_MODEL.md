@@ -67,7 +67,7 @@ deterministic Rust code — the LLM critic is a second layer only and
 |---|---|
 | Oversized write (> 10 MiB) | `write_file` checks size **before** opening any file handle; returns `FileTooLarge`. |
 | Prompt injection via file content (`IGNORE PREVIOUS INSTRUCTIONS…`) | `read_file` / `list_dir` return bytes. The kernel never interprets file content as instructions. Interpretation (if any) happens in the Python orchestrator, which has no ability to bypass the kernel's policy. |
-| CRLF / control characters in tool arguments | JSON serialisation escapes them; they become opaque string bytes inside the `args_hash`. One entry in, one entry out. |
+| CRLF / control characters in tool arguments | JSON serialisation escapes them; they become opaque string bytes inside the `args_hash`. One action in, exactly one `pending` + one resolution entry out. |
 | Deeply nested JSON as tool args (DoS) | `serde_json` has a default recursion limit; reasonable depths record and verify without panic. |
 
 ### 3.3 Audit log attacks
@@ -77,17 +77,26 @@ deterministic Rust code — the LLM critic is a second layer only and
 | HMAC byte flip in the DB | Every entry recomputes HMAC-SHA256 on `open`. Byte-flip tests exhaust all 32 bytes of every test entry. |
 | `prev_hmac` tampering (broken chain link) | `verify()` walks the chain; mismatch aborts open with `AuditCorrupted`. |
 | Intermediate row deletion | `sequence_no` contiguity check catches the gap. |
-| Tail truncation (delete the last row) | In-DB chain alone cannot detect this; `anchor.log` records a witness outside the DB and flags the mismatch on open. |
+| Tail truncation (delete the last rows) | In-DB chain alone cannot detect this. `anchor.log` (outside the DB, same disk, unkeyed) catches a truncation of the DB alone. A **head witness** in the OS keyring (last `sequence_no` + HMAC, one entry per log) catches a coordinated truncation of DB *and* anchor, and a deleted or replaced `audit.db`: a log shorter than its witness fails with `AuditCorrupted`. |
+| Planted trigger or view in `audit.db` (e.g. `RAISE(IGNORE)` turning every INSERT into a silent no-op) | `reli` refuses to open a database that contains any trigger or view, and every INSERT must report exactly one written row. |
+| Editing columns that look meaningful but are not signed | `status_reason` must be NULL for `pending`/`ok` and non-NULL for `error`/`rejected`; anything else is `AuditCorrupted`. |
+| Forcing the destructive v1→v2 migration on a v2 log (setting `schema_version` back to `1`) | Refused when the table already has v2 columns; a real v1 log is backed up (`audit.db.schema1.bak`) before migrating. |
 | Replay: insert a duplicate `sequence_no` | SQLite `UNIQUE` / `PRIMARY KEY` constraint rejects it at INSERT time; even if injected via raw SQL, the chain re-verification fails. |
 | Clock rollback or past-timestamp forgery | Timestamp is inside the HMAC input; any change breaks the chain. Ordering is enforced by `sequence_no`, not the clock. |
 | Wrong HMAC key on reopen (including deleted keyring entry) | Re-verification fails with `AuditCorrupted`. |
+| Side effect with no log entry (crash, power loss or log failure between acting and logging) | **Log before act:** a `pending` entry is committed with `synchronous = FULL` (plus `fullfsync` on macOS), and its anchor line and head witness are written, before approval and execution; if any of that fails, nothing runs. A `pending` left without outcome is closed as `error`/`abandoned` ("may or may not have run") by the next session, which names it on the terminal. |
+| Two `reli` processes racing on the log (or one closing the other's in-flight `pending` as abandoned) | The database is opened with an exclusive file lock; a second process (including `reli reset`) waits about 2 s and exits with code `6`. |
+| Forged or inconsistent outcome (resolving a non-pending row, resolving twice, outcome for different args) | Checked by `verify()` for every v2 row, plus a `UNIQUE` index on `resolves_seq`. Only possible at all with the HMAC key. |
 
 ### 3.4 Orchestration / approval attacks
 
 | Vector | Mitigation |
 |---|---|
-| Non-interactive run silently auto-approving | Default in non-TTY / `--non-interactive` mode is **reject**. |
-| Stalled operator blocking a batch | 60-second timeout; on expiry the proposal is rejected, not approved. |
+| Non-interactive run silently auto-approving | Default in non-TTY / `--non-interactive` mode is **reject**, recorded as `rejected` / `non_interactive`. |
+| Stalled operator blocking a batch | 60-second timeout; on expiry the proposal is rejected (`timeout`), not approved. |
+| Rejected proposals leaving no trace | Every proposal that reaches the kernel is logged as `pending` before the prompt; refusals are logged as `user_denied`, `timeout` or `non_interactive`. Proposals the critic rejects, malformed proposals and `--dry-run` never reach the kernel and are not logged. |
+| A human approving (or hiding) a rule-violating proposal | Path and size rules run **before** the prompt; a violation is logged as `rejected` / `policy: …` and the human is not asked. |
+| Using the log as a data channel (an LLM-chosen path stored in clear) | Arguments are only stored as `args_hash`; refusal reasons are fixed codes (`policy: path_outside_sandbox`, `io: NotFound`, …), never the path or OS error text. |
 | Orchestrator forging a proposal as "already approved" | The Rust kernel owns the approval gate; the Python side can only *propose*. |
 | LLM critic "approving" a rule-violating action | The critic is architecturally downstream of the policy engine and can only reject further. A critic approval never overrides a hard-rule rejection. |
 
@@ -131,11 +140,19 @@ They are documented here so no user is surprised.
 - **Linux without libsecret.** Fallback to a local encrypted file is a
   strict downgrade versus a native keyring. Documented in
   `KNOWN_ISSUES.md`.
-- **Antivirus / Windows Defender touching the sandbox.** An AV tool that
-  rewrites or quarantines a sandboxed file can make the HMAC chain report
-  tampering — a *true* positive against the file, but a false positive
-  against the user. Mitigation: recommend an AV exclusion in docs; never
-  silently "fix" the chain.
+- **Sandbox contents are not covered by the log.** The log records which
+  actions ran (tool, `args_hash`, outcome), not what the files contain.
+  An antivirus — or anyone — that rewrites or quarantines a sandboxed file
+  afterwards is **not** detected by `reli verify`.
+- **Rollback of the OS credential store.** The head witness relies on the
+  keyring being out of reach of an attacker who can only modify files. On
+  Windows the Credential Manager is itself stored in (DPAPI-encrypted)
+  files: someone who saved an old copy of them can restore it together
+  with an older, consistent copy of `audit.db` and `anchors/`. Only an
+  external or hardware-backed witness (TPM, remote log) would stop that.
+- **Network file systems.** SQLite's file locks are unreliable on SMB/NFS.
+  Keep `~/.reliagent/` on a local disk; on a network share two `reli`
+  processes could race despite the exclusive lock.
 - **SHA-256 collision resistance.** Treated as cryptographically sound in
   2026; a break in SHA-256 would invalidate the chain.
 
@@ -160,9 +177,10 @@ They are documented here so no user is surprised.
 - This file is part of the repository and versioned alongside the code.
 - Any PR that weakens a guarantee here must update this file in the same
   commit, with rationale.
-- `hash_format_version` is pinned at `1` for v0.1.0. Any change to the
-  fields covered by HMAC or the serialisation order requires bumping it
-  and writing a migration. See [`HASH_FORMAT.md`](HASH_FORMAT.md).
+- New rows are written with `hash_format_version = 2`; version `1` rows
+  remain verifiable. Any change to the fields covered by HMAC or the
+  serialisation order requires bumping it and writing a migration. See
+  [`HASH_FORMAT.md`](HASH_FORMAT.md).
 
 ---
 

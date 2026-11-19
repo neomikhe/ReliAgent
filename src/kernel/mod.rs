@@ -1,5 +1,6 @@
 pub mod anchor;
 pub mod audit;
+pub mod head;
 pub mod keyring;
 pub mod policy;
 pub mod sandbox;
@@ -27,6 +28,13 @@ pub enum KernelError {
 
     #[error("audit error: {0}")]
     Audit(String),
+
+    /// Otro proceso tiene el log bloqueado. No implica manipulación.
+    #[error(
+        "audit log is in use by another process (another reli, or a tool reading audit.db); \
+         only one may use it at a time"
+    )]
+    AuditBusy,
 
     #[error("keyring error: {0}")]
     Keyring(String),

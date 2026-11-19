@@ -1,105 +1,148 @@
-# Hash Format — v1 (ReliAgent v0.1.0)
+# Hash Format — v2 (ReliAgent v0.1.0)
 
 > **Scope.** This document is the byte-level, reproducible specification of
 > a single audit entry and its HMAC. It is the contract an external
 > verifier has to implement to validate a `reli` audit log without any
 > ReliAgent code.
 >
-> **Version.** `hash_format_version = 1`. This number is persisted on every
-> row of `audit_entries`. Any change to the serialisation, the field set,
-> the ordering, or the HMAC algorithm requires a new version number and a
-> migration plan. See [§6 Compatibility](#6-compatibility-and-future-versions).
+> **Version.** New rows are written with `hash_format_version = 2`. Rows
+> written by earlier builds carry `hash_format_version = 1` and remain
+> verifiable (§6). The number is persisted on every row of
+> `audit_entries`. Any change to the serialisation, the field set, the
+> ordering, or the HMAC algorithm requires a new version number and a
+> migration plan.
 
 ---
 
 ## 1. Where things live
 
-| What | Path |
+| What | Where |
 |---|---|
 | Audit database | `~/.reliagent/audit.db` (SQLite) |
-| Rolling anchor log | `~/.reliagent/anchors/` (one JSON-lines file per rotation) |
-| HMAC key | OS keyring entry (`service = "reliagent"`, `account = "hmac-v1"`) |
+| Backup taken before the v1→v2 migration | `~/.reliagent/audit.db.schema1.bak` |
+| Rolling anchor log | `~/.reliagent/anchors/anchor.log`, rotated to `anchor.log.1`, `anchor.log.2`, … |
+| HMAC key | OS keyring, `service = "reliagent"`, `account = "audit-hmac-v1"` |
+| Head witness | OS keyring, `service = "reliagent"`, `account = "audit-head-v1:<16 hex>"` — one per log, derived from the SHA-256 of the canonical path of `audit.db` (§5.5) |
 
-Audit entries are stored in the `audit_entries` table defined in
-[`src/kernel/migrations/v1.sql`](../src/kernel/migrations/v1.sql). The
-database uses WAL journaling (`journal_mode = WAL`) and
-`synchronous = NORMAL`.
+Audit entries live in the `audit_entries` table. The schema is created by
+[`v1.sql`](../src/kernel/migrations/v1.sql) and upgraded by
+[`v2.sql`](../src/kernel/migrations/v2.sql) (`schema_meta.schema_version =
+"2"`). The database uses:
+
+- `journal_mode = WAL` and `synchronous = FULL` (plus `fullfsync` on
+  macOS): a committed row survives power loss, which is what makes "log
+  before act" meaningful (§5.3).
+- `locking_mode = EXCLUSIVE`: one process uses the log at a time. Another
+  `reli` waits about 2 s and exits with code `6`; other tools are blocked
+  too. Run external verifiers while `reli` is not running.
+- No triggers and no views. `reli` refuses to open a database that has
+  any (§5.6).
 
 ---
 
 ## 2. Logical entry
 
-Each entry is a tuple of nine fields:
-
 | # | Field | Type | Notes |
 |---|---|---|---|
 | 1 | `sequence_no` | `u64` | Strictly monotonic, starts at `0`, contiguous, never reused. Primary key. |
-| 2 | `timestamp` | `String` | RFC 3339 with offset (`YYYY-MM-DDTHH:MM:SS±HH:MM` or `...Z`). Set at `record()` time using `OffsetDateTime::now_utc()`. |
-| 3 | `tool` | `String` | The logical operation name, e.g. `write_file`, `read_file`, `list_dir`. UTF-8. |
-| 4 | `args_hash` | `String` | Lowercase hex of `SHA-256(serde_json::to_vec(args))`. 64 characters. |
-| 5 | `status` | tagged enum | `{"kind": "ok"}` or `{"kind": "rejected", "reason": "<text>"}`. |
-| 6 | `prev_hmac` | `String` | Lowercase hex of the previous entry's `hmac`. For `sequence_no = 0` this is the literal ASCII string `"GENESIS"`. |
-| 7 | `hash_format_version` | `u32` | `1` for this document. Stored per row to allow future verifier dispatch. |
-| 8 | `hmac` | `String` | Lowercase hex of HMAC-SHA-256 over the JSON-serialised entry above. 64 characters. |
+| 2 | `timestamp` | `String` | RFC 3339 in UTC (`...Z`), set when the row is recorded. Informational: ordering is `sequence_no`. |
+| 3 | `tool` | `String` | `write_file`, `read_file` or `list_dir`. UTF-8. |
+| 4 | `args_hash` | `String` | Lowercase hex of `SHA-256(serde_json::to_vec(args))`. 64 characters. See §3. |
+| 5 | `status` | tagged enum | `{"kind":"pending"}`, `{"kind":"ok"}`, `{"kind":"error","reason":"<text>"}` or `{"kind":"rejected","reason":"<text>"}`. |
+| 6 | `resolves` | `u64`, optional | v2 resolution rows only: the `sequence_no` of the `pending` row they close. Absent otherwise. |
+| 7 | `prev_hmac` | `String` | Lowercase hex of the previous entry's `hmac`. For `sequence_no = 0` this is the literal ASCII string `"GENESIS"`. |
+| 8 | `hash_format_version` | `u32` | `2` for rows written now, `1` for legacy rows. |
+| 9 | `hmac` | `String` | Lowercase hex of HMAC-SHA-256 over fields 1–8 (§4). 64 characters. |
 
-Fields 1–7 together form the **signed payload**. Field 8 is the signature
-over that payload.
+In SQLite, `status` is split into `status_kind` + `status_reason`, and
+`resolves` is the column `resolves_seq` (`NULL` when absent).
+`status_reason` is `NULL` for `pending` and `ok` and non-`NULL` for
+`error` and `rejected` — it is only signed as part of `status`, so any
+other combination is treated as tampering.
+
+### 2.1 One action, two rows (v2)
+
+Every action that reaches the kernel — a direct `reli write/read/ls`, or a
+proposal from the agent that the critic approved — produces:
+
+1. A **`pending`** row, committed **before** the action is checked
+   against the policy, shown to the human, or executed. It names the tool
+   and the `args_hash`.
+2. A **resolution** row with `resolves = <pending seq>`, the same `tool`
+   and the same `args_hash`, and one of:
+
+| `status` | Meaning | `reason` |
+|---|---|---|
+| `ok` | The action ran and succeeded. | — |
+| `rejected` | The action did **not** run. | `policy: path_outside_sandbox`, `policy: invalid_path (<fixed kernel text>)`, `policy: file_too_large (<n> > <max> bytes)`; or, from the approval gate, `user_denied`, `timeout`, `non_interactive` |
+| `error` | The action was attempted and failed, or its outcome is unknown. | `io: <ErrorKind>` (e.g. `io: NotFound`); `abandoned: …` (below) |
+
+Reasons are fixed codes: they never contain the path (which the model may
+choose) or text from the operating system.
+
+Actions are strictly sequential: a new `pending` row is only written when
+every earlier one has a resolution. A `pending` row with no resolution
+means the process ended between the two rows (crash, power loss, Ctrl+C).
+The next `reli` command that records an action first closes it with
+`status = error` and a reason starting with `abandoned:`. It is `error`,
+not `rejected`, because the action **may or may not have run**.
+
+Proposals the critic rejects, malformed proposals and `--dry-run` never
+reach the kernel and are not logged.
+
+### 2.2 Legacy v1 rows
+
+v1 rows are one row per action: `status` is only `ok` or `rejected`, and
+`resolves` is always absent.
 
 ---
 
 ## 3. Canonicalisation of `args`
 
-`args` is any user-defined serialisable value (`impl Serialize`). Before
-hashing:
+`args` is a fixed Rust struct per tool, serialised with `serde_json`
+before hashing:
+
+| Tool | `args` (exact bytes) |
+|---|---|
+| `write_file` | `{"path":"<path>","bytes":<content length>}` (the content itself is not logged) |
+| `read_file` | `{"path":"<path>"}` |
+| `list_dir` | `{"path":"<path>"}` (`"."` for the sandbox root) |
 
 ```rust
 let bytes = serde_json::to_vec(args)?;
 let args_hash = hex::encode(Sha256::digest(&bytes));
 ```
 
-**Caveat (v1).** `serde_json::to_vec` is not strict JCS (RFC 8785): field
-order in nested structs depends on the source type's field order, and maps
-are emitted in insertion order. This means two *logically equivalent* JSON
-inputs with different key orders will produce **different** `args_hash`
-values today.
-
-For ReliAgent's own tool calls this is deterministic because the argument
-types are fixed Rust structs, but third-party integrations should not
-assume JCS semantics yet. Full JCS canonicalisation is tracked for v0.2 —
-see the `v15_jcs_canonicalization` test in `tests/red_team.rs`.
+**Caveat.** `serde_json::to_vec` is not strict JCS (RFC 8785). For
+ReliAgent's own tool calls the bytes are deterministic because the
+argument types are fixed structs, but third-party integrations should not
+assume JCS semantics. See the `v15_jcs_canonicalization` test in
+`tests/red_team.rs`.
 
 ---
 
 ## 4. HMAC input
 
-The HMAC input is the UTF-8 encoding of a JSON object containing the
-signed payload (fields 1–7) in **source declaration order** of the
-`AuditEntry` struct in [`src/kernel/audit.rs`](../src/kernel/audit.rs):
+The HMAC input is the UTF-8 encoding of a compact JSON object with fields
+1–8 in this order. `resolves` is **omitted** (not `null`) when absent, so a
+v1 row's bytes are exactly what v1 code signed:
 
 ```json
-{
-  "sequence_no":       <u64>,
-  "timestamp":         "<rfc3339>",
-  "tool":              "<tool>",
-  "args_hash":         "<hex-sha256>",
-  "status":            {"kind":"ok"}  |  {"kind":"rejected","reason":"..."},
-  "prev_hmac":         "<hex or \"GENESIS\">",
-  "hash_format_version": 1
-}
+{"sequence_no":0,"timestamp":"…","tool":"write_file","args_hash":"…","status":{"kind":"pending"},"prev_hmac":"GENESIS","hash_format_version":2}
+{"sequence_no":1,"timestamp":"…","tool":"write_file","args_hash":"…","status":{"kind":"ok"},"resolves":0,"prev_hmac":"<hmac of row 0>","hash_format_version":2}
+{"sequence_no":3,"timestamp":"…","tool":"write_file","args_hash":"…","status":{"kind":"rejected","reason":"user_denied"},"resolves":2,"prev_hmac":"…","hash_format_version":2}
 ```
 
-The serialiser is `serde_json::to_vec` with default options (no extra
-whitespace, UTF-8, ASCII-preserving numeric encoding).
-
-The HMAC is then:
+The serialiser is `serde_json::to_vec` with default options: no
+whitespace, UTF-8, keys in the order above, `status` fields in the order
+`kind`, `reason`.
 
 ```
-hmac = HMAC-SHA256(key = keyring[reliagent/hmac-v1], message = utf8(above))
+hmac = HMAC-SHA256(key = keyring[reliagent/audit-hmac-v1], message = utf8(above))
 ```
 
-and is stored as lowercase hex. The key is exactly 32 bytes; attempting to
-open the store with a key of a different length fails immediately with
-`Audit("HMAC key length N != expected 32")`.
+stored as lowercase hex. The key is exactly 32 bytes; opening the store
+with a key of a different length fails immediately.
 
 ---
 
@@ -107,66 +150,115 @@ open the store with a key of a different length fails immediately with
 
 ### 5.1 Genesis
 
-The first entry in any log has `sequence_no = 0` and
-`prev_hmac = "GENESIS"`. The literal ASCII string `GENESIS` is part of the
-HMAC input — an attacker cannot omit the genesis marker without breaking
-the HMAC.
+The first entry has `sequence_no = 0` and `prev_hmac = "GENESIS"`. The
+literal string is part of the HMAC input.
 
 ### 5.2 Linking
 
-For every `n > 0`:
+For every `n > 0`: `entry[n].prev_hmac == entry[n-1].hmac`. The chain is
+strictly linear by `sequence_no`; `resolves` is a semantic link, not part
+of the linking rule.
+
+### 5.3 Log before act
+
+Before the policy check, the approval prompt or any file-system access,
+the kernel:
+
+1. commits the `pending` row (`synchronous = FULL`), checking that SQLite
+   reports exactly one written row;
+2. appends its anchor line (§5.4) and updates the head witness (§5.5).
+
+If any of that fails, the action does not run. If recording the
+resolution fails after the action ran, the error names the outcome that
+was lost, the `pending` row is still in the log, and the next session
+closes it as `abandoned`. So every side effect has at least a `pending`
+row describing it.
+
+### 5.4 Anchor log
+
+Each committed row is also appended to `anchors/anchor.log` as one line:
 
 ```
-entry[n].prev_hmac == entry[n-1].hmac
+<sequence_no>\t<hmac>\t<timestamp>
 ```
 
-Verification walks entries in ascending `sequence_no` and checks that each
-`prev_hmac` matches the prior row's `hmac`, and that each row's `hmac`
-recomputes from the signed payload using the keyring key.
+After 100 lines the file is renamed to `anchor.log.N` and a new one is
+started. On open, the store checks that the most recent anchor line
+references a `sequence_no` present in the DB **and** that the DB's HMAC
+for that row matches. A mismatch or a missing row is `AuditCorrupted`.
 
-### 5.3 Anchor log
+Writing the anchor is mandatory for `pending` rows and best-effort (a
+warning) for resolutions. If there is no anchor file at all, the check is
+skipped. The anchor has no key and lives on the same disk: it catches a
+truncation of the DB alone, not one of the DB and the anchor together —
+that is what §5.5 is for.
 
-Because the in-DB chain alone cannot detect **tail truncation** (removing
-the newest entry leaves a consistent prefix), ReliAgent additionally
-writes a lightweight witness outside the DB:
+### 5.5 Head witness
 
-- Directory: `~/.reliagent/anchors/`
-- Format: one JSON object per line, `{"sequence_no": N, "hmac": "<hex>"}`
-- Rotation: after `DEFAULT_ANCHOR_ROTATE_LINES` entries, the current file
-  is closed and a new one opens. Old files stay on disk.
+After every committed row, `reli` stores `<sequence_no>:<hmac>` of that
+row in the OS keyring (§1), out of reach of an attacker who can only
+modify files. On open:
 
-On `open`, the store verifies that the most recent anchor entry references
-a `sequence_no` present in the DB **and** that the DB's HMAC for that row
-matches the anchor's HMAC. A mismatch or a missing row is
-`AuditCorrupted`.
+- the row at the witness's `sequence_no` must exist and have that `hmac`
+  — otherwise `AuditCorrupted` (tail truncated, or `audit.db` deleted or
+  replaced);
+- rows **after** the witness are accepted (a crash between the SQLite
+  commit and the keyring write);
+- a log without a witness (created before this feature) adopts its
+  current last row.
 
-### 5.4 Verification outcomes
+Like the anchor, the witness is mandatory for `pending` rows and
+best-effort for resolutions. `reli reset --wipe-everything` deletes it.
 
-`AuditStore::verify` returns:
+### 5.6 Verification rules
 
-- `Ok(())` — every row's HMAC recomputes, every `prev_hmac` matches, and
-  the latest anchor agrees with the DB.
-- `Err(KernelError::AuditCorrupted { sequence_no, reason })` — the point
-  of the first detected inconsistency.
+A log verifies when the database contains no triggers or views, and
+walking rows by ascending `sequence_no`:
 
-On failure, `reli` enters **read-only** mode: the log is inspectable and
-exportable, but no new entries may be recorded. Recovery is manual
-(forensics, or `reli reset --wipe-everything`).
+1. `sequence_no` equals the row's position.
+2. `hash_format_version` is `1` or `2`.
+3. `prev_hmac` matches the previous row's `hmac` (or `"GENESIS"`).
+4. The HMAC recomputes from fields 1–8 with the keyring key.
+5. `status_reason` is `NULL` exactly for `pending` and `ok` (§2).
+6. **v1 rows:** `status` is `ok` or `rejected`, no `resolves`, and no v1
+   row appears after a v2 row.
+7. **v2 rows:** a `pending` row has no `resolves` and is only allowed
+   when no other `pending` row is open; any other row has `resolves = p`
+   where `p` is the open v2 `pending` row, with the same `tool` and
+   `args_hash`.
+8. The latest anchor line agrees with the DB (§5.4) and the log is not
+   shorter than its head witness (§5.5).
+
+An unresolved `pending` row is allowed only as the last open action
+(§2.1). Rules 6–7 can only fail for rows that are correctly signed, i.e.
+a bug or someone holding the key.
+
+### 5.7 Verification outcomes
+
+`AuditStore::verify` returns `Ok(())` or
+`Err(KernelError::AuditCorrupted { sequence_no, reason })` at the first
+inconsistency. In v0.1.0 `reli` then refuses every command that opens the
+log (exit code `3`); recovery is manual (forensics on a copy of the
+files, or `reli reset --wipe-everything`). Exit code `6` only means the
+log is in use by another process; it never indicates tampering.
 
 ---
 
 ## 6. Compatibility and future versions
 
-- Every row stores its `hash_format_version`. On load, any row with a
-  version other than the running code's supported set is rejected.
-- Bumping this version number requires:
-  1. A new migration in `src/kernel/migrations/`.
-  2. A new section in this file describing the v2 payload.
-  3. Dispatching in the verifier so mixed logs (v1 rows followed by v2
-     rows) can still be walked end-to-end.
-- Fields that are **not** in the HMAC input today — and therefore can be
-  changed without a version bump — are limited to: nothing. Every field
-  of `AuditEntry` (except the `hmac` itself) is covered.
+- Opening a schema-1 database first copies it to `audit.db.schema1.bak`
+  (`VACUUM INTO`, never overwriting an existing backup), then migrates it
+  to schema 2 (`v2.sql`): the table is rebuilt to allow the new statuses
+  and the `resolves_seq` column; existing rows are copied unchanged and
+  still verify as v1.
+- If `schema_version` says `1` but the table already has v2 columns, the
+  migration is refused (it would erase `resolves_seq`).
+- A unique index on `resolves_seq` makes SQLite refuse a second
+  resolution of the same `pending` row.
+- A new hash format requires: a new migration, a new section here, and
+  verifier dispatch on `hash_format_version` so mixed logs still verify.
+- No field of the entry is outside the HMAC (except `hmac` itself);
+  `status_reason` is covered as part of `status`, with the rule in §2.
 
 ---
 
@@ -175,53 +267,79 @@ exportable, but no new entries may be recorded. Recovery is manual
 ```python
 import hmac, hashlib, json, sqlite3
 
+class Corrupted(Exception):
+    pass
+
+def check(condition, message):
+    if not condition:  # not `assert`: it disappears under `python -O`
+        raise Corrupted(message)
+
 def verify(db_path, key: bytes) -> None:
-    conn = sqlite3.connect(db_path)
+    # Read-only, and only while reli is not running (it holds an
+    # exclusive lock). Compare the head witness and anchors/ separately.
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    foreign = conn.execute(
+        "SELECT type, name FROM sqlite_master WHERE type IN ('trigger','view')"
+    ).fetchall()
+    check(not foreign, f"unexpected schema objects: {foreign}")
     rows = conn.execute("""
-        SELECT sequence_no, timestamp, tool, args_hash,
-               status_kind, status_reason, prev_hmac, hmac,
-               hash_format_version
-          FROM audit_entries
-         ORDER BY sequence_no ASC
+        SELECT sequence_no, timestamp, tool, args_hash, status_kind,
+               status_reason, resolves_seq, prev_hmac, hmac, hash_format_version
+          FROM audit_entries ORDER BY sequence_no ASC
     """).fetchall()
 
-    expected_prev = "GENESIS"
-    for (seq, ts, tool, args_hash, status_kind, status_reason,
-         prev_hmac, stored_hmac, hfv) in rows:
+    expected_prev, seen_v2, open_pending = "GENESIS", False, {}
+    for i, (seq, ts, tool, args_hash, kind, reason, resolves,
+            prev_hmac, stored_hmac, hfv) in enumerate(rows):
+        check(seq == i, f"gap or reorder at {seq}")
+        check(hfv in (1, 2), f"unsupported hash_format_version {hfv} at {seq}")
+        check(prev_hmac == expected_prev, f"chain break at {seq}")
+        check((reason is None) == (kind in ("pending", "ok")),
+              f"status_reason does not match status at {seq}")
 
-        assert hfv == 1, f"unsupported hash_format_version {hfv}"
-        assert prev_hmac == expected_prev, f"chain break at {seq}"
+        status = {"kind": kind}
+        if kind in ("error", "rejected"):
+            status["reason"] = reason
+        payload = {"sequence_no": seq, "timestamp": ts, "tool": tool,
+                   "args_hash": args_hash, "status": status}
+        if resolves is not None:
+            payload["resolves"] = resolves
+        payload["prev_hmac"] = prev_hmac
+        payload["hash_format_version"] = hfv
+        message = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        recomputed = hmac.new(key, message.encode("utf-8"), hashlib.sha256).hexdigest()
+        check(recomputed == stored_hmac, f"hmac mismatch at {seq}")
 
-        if status_kind == "ok":
-            status = {"kind": "ok"}
+        if hfv == 1:
+            check(not seen_v2 and kind in ("ok", "rejected") and resolves is None,
+                  f"invalid v1 row at {seq}")
+        elif kind == "pending":
+            seen_v2 = True
+            check(resolves is None and not open_pending,
+                  f"pending at {seq} while another action is open")
+            open_pending[seq] = (tool, args_hash)
         else:
-            status = {"kind": "rejected", "reason": status_reason or ""}
-
-        payload = json.dumps({
-            "sequence_no": seq,
-            "timestamp": ts,
-            "tool": tool,
-            "args_hash": args_hash,
-            "status": status,
-            "prev_hmac": prev_hmac,
-            "hash_format_version": hfv,
-        }, separators=(",", ":"))  # serde_json default is compact
-
-        recomputed = hmac.new(key, payload.encode("utf-8"),
-                              hashlib.sha256).hexdigest()
-        assert recomputed == stored_hmac, f"hmac mismatch at {seq}"
+            seen_v2 = True
+            check(open_pending.pop(resolves, None) == (tool, args_hash),
+                  f"row {seq} does not resolve the open pending action")
         expected_prev = stored_hmac
 ```
 
-> **Note.** `serde_json`'s default output uses no separators (`,` and `:`
-> with no surrounding whitespace), which matches `json.dumps(...,
-> separators=(",", ":"))`. If you ever see extra whitespace in the canonical
-> payload, the byte stream changed and that is a bug in the recorder, not
-> the verifier.
+> **Note.** `serde_json` emits no whitespace and keeps non-ASCII characters
+> as UTF-8, which matches `json.dumps(..., separators=(",", ":"),
+> ensure_ascii=False)`. If you see a mismatch only on rows with non-ASCII
+> paths or reasons, check `ensure_ascii`.
 
 ---
 
 ## 8. Change log
 
-- **v1 — 2026-04-21.** Initial format. Fields as above. HMAC-SHA-256,
-  32-byte key from OS keyring, genesis marker `"GENESIS"`.
+- **v2 — 2026-11-18.** Two rows per action (`pending` before acting, then
+  `ok` / `error` / `rejected` with `resolves`). New statuses `pending` and
+  `error`; `abandoned` closes orphaned `pending` rows; refusal reasons are
+  fixed codes. `synchronous = FULL`, an exclusive lock on the database, a
+  head witness in the OS keyring, and rejection of triggers, views and
+  unsigned `status_reason` values. v1 rows remain valid.
+- **v1 — 2026-04-21.** Initial format: one row per action, `ok` /
+  `rejected`. HMAC-SHA-256, 32-byte key from the OS keyring, genesis
+  marker `"GENESIS"`.

@@ -30,14 +30,15 @@ will show a blue "Windows protected your PC" dialog on first run.
 
 Some AV tools (Defender, Kaspersky, Bitdefender, CrowdStrike) actively
 rewrite or quarantine files inside user directories for threat analysis.
-If the AV touches a file `reli` wrote, the next `reli verify` will flag
-the sandbox contents as "modified outside the chain" — which is **true**
-at the file-system level but not the action we care about.
+`reli verify` does **not** notice: the audit log records which actions
+ran and with what outcome, not the contents of the sandbox. A file you
+find changed or missing may have been touched by the AV, not by `reli`.
 
-- **Workaround:** Add `~/ReliAgent_Sandbox/` to your AV exclusion list.
+- **Workaround:** Add `~/ReliAgent_Sandbox/` to your AV exclusion list if
+  you need the sandbox to stay exactly as `reli` left it.
 - **Non-workaround:** Do **not** add `~/.reliagent/` to the exclusion
-  list. That directory holds the audit DB and keyring-derived state;
-  making AV blind to it would weaken detection of a real compromise.
+  list. That directory holds the audit DB and anchors; making AV blind to
+  it would weaken detection of a real compromise.
 
 ### `MAX_PATH` (260 characters)
 
@@ -77,10 +78,10 @@ in v0.1.0.
 
 ### Keychain prompts
 
-The first `record()` call triggers a Keychain access prompt ("reli wants
-to use the keychain"). This is expected; grant "Always Allow" to avoid
-prompts on every action. The keychain entry is named `reliagent` /
-`hmac-v1`.
+The first command that opens the audit log triggers a Keychain access
+prompt ("reli wants to use the keychain"). This is expected; grant
+"Always Allow" to avoid prompts on every action. The keychain entry is
+named `reliagent` / `audit-hmac-v1`.
 
 ---
 
@@ -110,6 +111,72 @@ Running `reli` inside a Flatpak sandbox that denies `~/ReliAgent_Sandbox`
 access will cause every `write_file` to fail with `Io`. ReliAgent's own
 sandbox is not compatible with an outer sandbox that hides the home
 directory. Use the native binary.
+
+---
+
+## Audit log
+
+### One `reli` at a time
+
+The audit database is opened with an exclusive lock for the whole command
+(including the 60 s approval prompt of `reli run`). A second `reli` —
+including `reli reset` — started meanwhile waits about 2 s and exits with
+code `6` ("audit log is in use"). Code `6` never means tampering; code `3`
+does (or another audit/keyring failure). Other tools that open `audit.db`
+(`sqlite3`, the verifier in [HASH_FORMAT.md](docs/HASH_FORMAT.md)) are
+blocked too and use their own timeouts: run them while `reli` is not
+running, or on a copy of the files.
+
+Keep `~/.reliagent/` on a local disk. SQLite's locks are unreliable on
+network file systems (SMB, NFS).
+
+### `abandoned` entries
+
+If `reli` is killed (Ctrl+C, crash, power loss) between logging an action
+as `pending` and logging its outcome, the next `reli` that records an
+action closes it as `error` with reason `abandoned: …` and prints its
+sequence number, tool and time. Check the sandbox by hand for those: the
+action may or may not have run. `reli verify` and `reli sandbox status`
+list actions still waiting for that.
+
+### Head witness in the OS keyring
+
+Next to the HMAC key, `reli` keeps one keyring entry per audit log
+(`reliagent` / `audit-head-v1:<16 hex chars>`, derived from the log's
+path) holding the sequence number and HMAC of the last entry. It is
+updated twice per action. A log that is shorter than its witness — tail
+rows deleted, or `audit.db` deleted or replaced — fails verification
+(exit code `3`).
+
+- **Deleting `~/.reliagent/` by hand now looks like tampering.** Use
+  `reli reset --wipe-everything`, which also removes the witness.
+- Using several `--audit-dir` values creates one witness per directory;
+  `reli reset` with the same `--audit-dir` removes it.
+- Restoring an old backup of `~/.reliagent/` fails verification for the
+  same reason. Restore it only together with `reli reset`, or after
+  removing that log's witness entry from the keyring.
+
+### One-way upgrade of the log format
+
+Opening an existing audit log with this version migrates its schema to
+version 2 (log format v2: `pending` + outcome per action). Old entries are
+kept and still verify, and the original database is first copied to
+`~/.reliagent/audit.db.schema1.bak`. An older `reli` binary will refuse
+the migrated database ("unsupported schema version"); use the backup to
+go back.
+
+### Durability costs a little time
+
+Each action commits two entries with `synchronous = FULL` (a disk flush
+each; `F_FULLFSYNC` on macOS), so the log survives power loss. Expect a
+few milliseconds per action on an SSD, more on slow disks.
+
+### `reli read` on a terminal
+
+When stdout is a terminal, `reli read` escapes control characters (escape
+sequences, `\r`, …) and replaces invalid UTF-8, because the file may have
+been written by the model. Newlines and tabs are kept. Pipe or redirect
+the output (`reli read a.bin > a.bin`) to get the exact bytes.
 
 ---
 

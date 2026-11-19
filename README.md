@@ -18,14 +18,18 @@ local AI agents. Instead of trusting the LLM with direct filesystem access
 (the usual LangChain / AutoGPT / CrewAI pattern), ReliAgent puts a small
 Rust kernel between the model and the OS:
 
-- The model *proposes* a tool call.
-- A deterministic Rust policy engine validates it. If the engine says
-  no, the engine wins. The LLM critic can only *also* say no — it cannot
-  overrule a rejection.
+- The model *proposes* a tool call. A deterministic critic and the LLM
+  critic can reject it; neither can approve what the kernel refuses.
+- The kernel writes the proposal to an HMAC-chained audit log as
+  `pending` **before** checking or running it. If that write fails,
+  nothing runs.
+- A deterministic Rust policy engine validates it (path jail, size cap).
+  If the engine says no, the engine wins — the human is not even asked.
 - A TTY prompt asks the human. Timeout or no TTY → default reject.
 - On approval, the action runs inside a `cap-std` sandbox capability.
-- The full before/after is written to an HMAC-chained audit log, signed
-  with a key stored in the OS keyring. Tampering is detectable with
+- The outcome (`ok`, `rejected` with the reason, or `error`) is written
+  as a second entry linked to the `pending` one. The log is signed with a
+  key stored in the OS keyring; tampering is detectable with
   `reli verify`.
 
 **What this is not.** It is not blockchain, not "provably secure", not a
@@ -47,9 +51,12 @@ read, nothing in the stack notices. ReliAgent's answer:
 
 1. **Determinism before intelligence.** Hard rules in Rust (path jail,
    size cap, TTY gate) run *before* any LLM heuristic.
-2. **Tamper-evidence by default.** Every action — approved or rejected —
-   is HMAC-chained. A passive attacker with disk access can read the log
-   but can't forge entries without the keyring key.
+2. **Log before act, tamper-evidence by default.** Every action that
+   reaches the kernel — approved, rejected by you or by policy, or failed
+   — is HMAC-chained, and it is logged before it can run. A passive
+   attacker with disk access can read the log but can't forge entries
+   without the keyring key, and can't shorten it unnoticed: the last
+   entry is also witnessed in the OS keyring.
 3. **No network.** The binary makes zero outbound calls. The Python
    sidecar only talks to `127.0.0.1:11434` (Ollama) — hard-coded, with
    proxies and redirects ignored. You download the model yourself with
@@ -147,7 +154,9 @@ same.
 To start over:
 
 ```bash
-# Wipes the sandbox, audit DB, anchors, and keyring entry. Irreversible.
+# Wipes the sandbox, audit DB, anchors and the keyring entries (HMAC key
+# and head witness). Irreversible. Use this instead of deleting
+# ~/.reliagent by hand, which would look like tampering.
 ./target/release/reli reset --wipe-everything
 ```
 
@@ -157,10 +166,20 @@ To start over:
 ./target/release/reli verify
 ```
 
-`verify` walks the HMAC chain and cross-checks against the anchor log. A
-successful verification prints the number of entries and the most recent
-HMAC. A failure prints the sequence number where tampering was detected
-and drops `reli` into read-only mode until you investigate or reset.
+`verify` walks the HMAC chain and cross-checks it against the anchor log
+and the head witness kept in the OS keyring. A successful verification
+prints the number of entries, the most recent HMAC and any action still
+waiting for its outcome. A failure prints the sequence number where tampering was detected,
+and from then on every `reli` command that opens the log refuses to run
+(exit code `3`) until you investigate or reset. The byte-level format is
+in [`docs/HASH_FORMAT.md`](docs/HASH_FORMAT.md).
+
+Each action appears as two entries: `pending` (written before the policy
+check, approval and execution) and its outcome. If `reli` is killed
+between the two, the next run records the leftover `pending` as
+`abandoned` — "may or may not have run" — and names it on the terminal.
+Only one `reli` process can use the log at a time; a second one waits
+about 2 s and exits with code `6` (busy, not tampering).
 
 ---
 
@@ -168,11 +187,11 @@ and drops `reli` into read-only mode until you investigate or reset.
 
 | Command | What it does | Exit codes |
 |---|---|---|
-| `reli run "<prompt>"` | Sends `<prompt>` to the Python sidecar, verifies Ollama and the pinned model, runs the agent/critic loop, gates every proposed tool call on the policy engine + TTY. `--dry-run` only shows the proposal; `--mock-llm` uses the deterministic test agent instead of Ollama. | `0` ok, `1` rejected, `2` bad input, `3` audit, `4` bridge / Ollama / model check, `5` timeout |
-| `reli verify` | Re-runs the HMAC chain + anchor cross-check over the whole audit DB. | `0` clean, `3` corrupted |
+| `reli run "<prompt>"` | Sends `<prompt>` to the Python sidecar, verifies Ollama and the pinned model, runs the agent/critic loop, gates every proposed tool call on the policy engine + TTY. `--dry-run` only shows the proposal; `--mock-llm` uses the deterministic test agent instead of Ollama. | `0` ok, `1` rejected, `2` bad input, `3` audit, `4` bridge / Ollama / model check, `5` timeout, `6` log in use |
+| `reli verify` | Re-runs the HMAC chain, anchor and head-witness checks over the whole audit DB. | `0` clean, `3` corrupted, `6` log in use |
 | `reli sandbox path` | Prints the sandbox root. | `0` |
-| `reli sandbox status` | Prints sandbox path, audit entry count, last HMAC, keyring label. | `0` |
-| `reli reset --wipe-everything` | Wipes sandbox, audit DB, anchors, and keyring entry. Asks for `WIPE` confirmation unless `--force`. | `0` / `1` |
+| `reli sandbox status` | Prints sandbox path, audit entry count, last HMAC, keyring label, open actions. | `0` / `6` |
+| `reli reset --wipe-everything` | Wipes sandbox, audit DB (and its migration backup), anchors, and the keyring entries. Asks for `WIPE` confirmation unless `--force`; refuses while another `reli` uses the log. | `0` / `1` / `6` |
 | `reli ping` | Pings the Python sidecar to confirm the bridge is alive. | `0` / `4` |
 
 Global flag `--non-interactive` turns every approval prompt into an

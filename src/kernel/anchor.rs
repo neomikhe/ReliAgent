@@ -51,7 +51,7 @@ impl AnchorLog {
             "{}\t{}\t{}",
             signed.entry.sequence_no, signed.hmac, signed.entry.timestamp,
         )?;
-        let _ = f.sync_data();
+        f.sync_data()?;
         self.lines_in_current += 1;
         Ok(())
     }
@@ -183,6 +183,7 @@ mod tests {
                 tool: "write_file".into(),
                 args_hash: "deadbeef".into(),
                 status: AuditStatus::Ok,
+                resolves: None,
                 prev_hmac: if seq == 0 {
                     "GENESIS".into()
                 } else {
