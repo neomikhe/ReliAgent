@@ -51,8 +51,10 @@ read, nothing in the stack notices. ReliAgent's answer:
    is HMAC-chained. A passive attacker with disk access can read the log
    but can't forge entries without the keyring key.
 3. **No network.** The binary makes zero outbound calls. The Python
-   sidecar only talks to `localhost:11434` (Ollama). Model download is
-   an explicit, one-shot, signed operation.
+   sidecar only talks to `127.0.0.1:11434` (Ollama) — hard-coded, with
+   proxies and redirects ignored. You download the model yourself with
+   `ollama pull`, and every `reli run` checks its SHA-256 against
+   [`MODEL_SHA256.txt`](MODEL_SHA256.txt) before any inference.
 
 If those tradeoffs match how you want local agents to behave, this is for
 you. If you need cloud-scale orchestration or production SLAs, this is
@@ -66,7 +68,8 @@ not that.
 |---|---|
 | Rust kernel (policy engine, sandbox, HMAC chain) | Implemented, ~90 unit tests + property tests. |
 | CLI (`reli run / verify / sandbox / reset`) | Implemented. |
-| Python sidecar (orchestrator + critic + Ollama client) | Implemented, mock-first test suite. |
+| Python sidecar (orchestrator + critic + Ollama client) | Implemented. Stdlib-only, no runtime dependencies. Tested against a local fake Ollama server; verified manually against Ollama 0.31.2. |
+| Model pinning (`qwen2.5:7b-instruct-q4_K_M`) | Weights SHA-256 pinned and re-checked on every `reli run`. |
 | Red-team suite (25 vectors from threat model §16) | Implemented in [`tests/red_team.rs`](tests/red_team.rs). |
 | `python-build-standalone` self-contained release | Scaffolded, not yet a one-shot installer. |
 | Tauri GUI | Not in v0.1. Planned for v0.2. |
@@ -83,8 +86,13 @@ Requirements:
 
 - Rust **1.85.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml))
 - Python **3.12** with [`uv`](https://github.com/astral-sh/uv)
-- An [Ollama](https://ollama.com/) install listening on `localhost:11434`
-  (for actual LLM use; tests run without it)
+- An [Ollama](https://ollama.com/) install listening on `127.0.0.1:11434`
+  with the canonical model pulled (for actual LLM use; tests and
+  `--mock-llm` run without it):
+
+  ```bash
+  ollama pull qwen2.5:7b-instruct-q4_K_M   # ~4.7 GB
+  ```
 
 ```bash
 git clone https://github.com/<org>/reliagent
@@ -121,9 +129,20 @@ The release binary lands at `target/release/reli`.
 ./target/release/reli run "create a file called notes.txt with a to-do list"
 ```
 
+Before the first inference, `reli run` checks that Ollama is reachable,
+that it has the pinned model, and that the model file on disk matches the
+SHA-256 in [`MODEL_SHA256.txt`](MODEL_SHA256.txt). If any check fails it
+stops and tells you what to do (start Ollama, `ollama pull ...`, or
+re-download a model that does not match).
+
 You will be prompted before any side effect. Answering `n`, letting the
 prompt time out (60 s), or running with `--non-interactive` all reject
 the proposal.
+
+No Ollama at hand? `reli run --mock-llm "write 'hola' to notes/hi.txt"`
+uses a deterministic test agent that understands only simple phrasings.
+Everything after the agent (policy engine, approval, audit log) is the
+same.
 
 To start over:
 
@@ -149,7 +168,7 @@ and drops `reli` into read-only mode until you investigate or reset.
 
 | Command | What it does | Exit codes |
 |---|---|---|
-| `reli run "<prompt>"` | Sends `<prompt>` to the Python sidecar, runs the agent/critic loop, gates every proposed tool call on the policy engine + TTY. | `0` ok, `1` rejected, `2` bad input, `3` audit, `4` bridge, `5` timeout |
+| `reli run "<prompt>"` | Sends `<prompt>` to the Python sidecar, verifies Ollama and the pinned model, runs the agent/critic loop, gates every proposed tool call on the policy engine + TTY. `--dry-run` only shows the proposal; `--mock-llm` uses the deterministic test agent instead of Ollama. | `0` ok, `1` rejected, `2` bad input, `3` audit, `4` bridge / Ollama / model check, `5` timeout |
 | `reli verify` | Re-runs the HMAC chain + anchor cross-check over the whole audit DB. | `0` clean, `3` corrupted |
 | `reli sandbox path` | Prints the sandbox root. | `0` |
 | `reli sandbox status` | Prints sandbox path, audit entry count, last HMAC, keyring label. | `0` |
@@ -182,7 +201,9 @@ reliagent/
 │   └── src/reliagent_python/
 │       ├── orchestrator.py
 │       ├── critic.py
-│       ├── llm_client.py   # Ollama HTTP client
+│       ├── llm_client.py   # client protocol + deterministic mock
+│       ├── ollama_http.py  # stdlib HTTP client, loopback-only
+│       ├── model_integrity.py  # pinned model SHA-256 check
 │       └── __main__.py     # stdin/stdout NDJSON server
 ├── tests/
 │   ├── bridge_jsonrpc.rs   # cross-process bridge integration
@@ -190,7 +211,7 @@ reliagent/
 ├── docs/
 │   ├── THREAT_MODEL.md
 │   └── HASH_FORMAT.md
-├── scripts/                # PBS + model fetch scaffolding
+├── scripts/                # python-build-standalone fetch scaffolding
 └── .github/workflows/      # release signing (cosign + SBOM)
 ```
 
@@ -224,9 +245,10 @@ for.
 
 [Apache License 2.0](LICENSE). See the `LICENSE` file for the full text.
 
-Third-party model licences are separate:
+Third-party components you install separately have their own licences:
 
-- Qwen2.5 weights — [Qwen Research Licence](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct).
+- Qwen2.5-7B-Instruct weights — [Apache 2.0](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE)
+  (other Qwen2.5 sizes use different licences).
 - Ollama — [MIT](https://github.com/ollama/ollama/blob/main/LICENSE).
 
-You must accept each third-party licence independently of ReliAgent.
+You accept each of them independently of ReliAgent.

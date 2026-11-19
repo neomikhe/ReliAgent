@@ -41,7 +41,6 @@ pub struct RpcError {
     pub code: i64,
     pub message: String,
     #[serde(default)]
-    #[allow(dead_code)]
     pub data: Option<Value>,
 }
 

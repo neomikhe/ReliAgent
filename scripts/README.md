@@ -9,7 +9,6 @@ project builds and tests fine without ever running anything here.
 | Script | Purpose |
 |---|---|
 | `fetch_pbs.sh` / `fetch_pbs.ps1` | Download a matching [python-build-standalone](https://github.com/astral-sh/python-build-standalone) tarball and verify its checksum. The bundled Python lives at `vendor/python/` and is consumed by `reli` as `--python` when available. |
-| `fetch_model.sh` / `fetch_model.ps1` | Download the canonical Qwen2.5 GGUF weights, verify the SHA-256 against [`../MODEL_SHA256.txt`](../MODEL_SHA256.txt), and print the Qwen licence URL the user must accept. Resumable via HTTP `Range`. |
 | `verify_release.sh` | After `cosign verify-blob` succeeds, cross-checks the SBOM against the installed file list. |
 
 ## Invariants
@@ -26,9 +25,13 @@ project builds and tests fine without ever running anything here.
 
 ## Status
 
-v0.1.0 ships the scripts as **scaffolding**. Exact upstream URLs and the
-Qwen SHA-256 in `MODEL_SHA256.txt` are placeholders — replace before
-cutting a public release. The release workflow at
+v0.1.0 ships the scripts as **scaffolding**. The python-build-standalone
+release tag and SHA-256 values in `fetch_pbs.*` are placeholders — replace
+before cutting a public release.
+
+The model is not fetched by any script here: users run
+`ollama pull qwen2.5:7b-instruct-q4_K_M`, and `reli run` verifies it
+against [`../MODEL_SHA256.txt`](../MODEL_SHA256.txt). The release workflow at
 `.github/workflows/release.yml` calls these scripts for the signed
 artifact build, so edits here must keep them CI-compatible (exit
 non-zero on failure, stdout machine-parseable).

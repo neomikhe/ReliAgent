@@ -10,7 +10,12 @@ stderr so they do not corrupt the wire protocol.
 ## Methods
 
 - `ping() -> {"pong": true}`
-- `agent.run(prompt: str, use_llm_critic: bool = False) -> AgentRunResult`
+- `agent.run(prompt: str, backend: "ollama" | "mock") -> AgentRunResult`
+
+  `backend` is mandatory. `"ollama"` verifies the local daemon and the pinned
+  model (see `model_integrity`) before any inference, and runs the LLM critic
+  as a second layer. `"mock"` uses the deterministic pattern-matching agent
+  (tests and offline demos).
 
 ## Error codes
 
@@ -21,16 +26,35 @@ Standard JSON-RPC 2.0 codes are used:
 - `-32601` method not found
 - `-32602` invalid params
 - `-32603` internal error (handler raised)
+
+Application codes (`error.data.kind` repeats them as a string):
+
+- `-32010` `ollama_unreachable` — nothing listening on 127.0.0.1:11434
+- `-32011` `model_missing` — Ollama lacks the pinned tag (`data.model`)
+- `-32012` `model_integrity` — Ollama's blob is not the pinned weights
+- `-32013` `llm_error` — Ollama failed during generation
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from typing import Any, Callable
 
-from reliagent_python.llm_client import MockOllamaClient, OllamaClient
+from reliagent_python.llm_client import MockOllamaClient
+from reliagent_python.model_integrity import (
+    CANONICAL_MODEL,
+    ModelIntegrityError,
+    verify_model,
+)
+from reliagent_python.ollama_http import (
+    ModelMissing,
+    OllamaClient,
+    OllamaError,
+    OllamaUnreachable,
+)
 from reliagent_python.orchestrator import Orchestrator
 
 # JSON-RPC error codes
@@ -39,6 +63,15 @@ _INVALID_REQUEST = -32600
 _METHOD_NOT_FOUND = -32601
 _INVALID_PARAMS = -32602
 _INTERNAL_ERROR = -32603
+
+# Códigos de aplicación (rango -32000..-32099). Rust los replica en
+# src/bridge/mod.rs; cambiarlos rompe el contrato.
+RPC_OLLAMA_UNREACHABLE = -32010
+RPC_MODEL_MISSING = -32011
+RPC_MODEL_INTEGRITY = -32012
+RPC_LLM_ERROR = -32013
+
+_BACKENDS = ("ollama", "mock")
 
 
 def _log(msg: str) -> None:
@@ -56,18 +89,48 @@ def _handle_agent_run(params: dict) -> dict:
     prompt = params.get("prompt")
     if not isinstance(prompt, str) or not prompt:
         raise _RpcError(_INVALID_PARAMS, "prompt must be a non-empty string")
-    use_llm_critic = bool(params.get("use_llm_critic", False))
-    use_real_ollama = bool(params.get("use_real_ollama", False))
+    backend = params.get("backend")
+    if not isinstance(backend, str) or backend not in _BACKENDS:
+        raise _RpcError(_INVALID_PARAMS, f"backend must be one of {list(_BACKENDS)}")
 
-    agent = OllamaClient() if use_real_ollama else MockOllamaClient()
-    # The second-layer LLM critic is not wired by default. When enabled with
-    # use_llm_critic=True and use_real_ollama=True, reuse a real Ollama
-    # client. Otherwise we leave it None (deterministic-only).
-    critic = OllamaClient() if (use_llm_critic and use_real_ollama) else None
+    if backend == "mock":
+        orch = Orchestrator(agent_client=MockOllamaClient())
+    else:
+        client = _verified_ollama_client()
+        # El mismo modelo actúa de crítico: solo puede rechazar.
+        orch = Orchestrator(agent_client=client, llm_critic_client=client)
 
-    orch = Orchestrator(agent_client=agent, llm_critic_client=critic)
-    result = orch.run(prompt)
+    try:
+        result = orch.run(prompt)
+    except OllamaError as e:
+        raise _RpcError(RPC_LLM_ERROR, str(e), {"kind": "llm_error"}) from e
     return result.to_dict()
+
+
+def _make_ollama_client(tag: str) -> OllamaClient:
+    return OllamaClient(tag)
+
+
+def _verified_ollama_client() -> OllamaClient:
+    """Comprueba daemon, modelo e integridad antes de cualquier inferencia."""
+    pin = CANONICAL_MODEL
+    client = _make_ollama_client(pin.tag)
+    try:
+        client.version()
+        info = client.show()
+        _log(f"verifying SHA-256 of {pin.tag} ({pin.size / 1e9:.1f} GB)...")
+        verify_model(info, pin)
+    except OllamaUnreachable as e:
+        raise _RpcError(RPC_OLLAMA_UNREACHABLE, str(e), {"kind": "ollama_unreachable"}) from e
+    except ModelMissing as e:
+        raise _RpcError(
+            RPC_MODEL_MISSING, str(e), {"kind": "model_missing", "model": pin.tag}
+        ) from e
+    except ModelIntegrityError as e:
+        raise _RpcError(RPC_MODEL_INTEGRITY, str(e), {"kind": "model_integrity"}) from e
+    except OllamaError as e:
+        raise _RpcError(RPC_LLM_ERROR, str(e), {"kind": "llm_error"}) from e
+    return client
 
 
 _METHODS: dict[str, Callable[[dict], dict]] = {
@@ -135,10 +198,16 @@ def _dispatch(request: dict) -> dict | None:
             return None
         return _error_response(req_id, e.code, e.message, e.data)
     except Exception as e:  # noqa: BLE001 — top of dispatch must not leak
-        _log(f"handler crashed: {e}\n{traceback.format_exc()}")
+        # Solo el tipo: el texto puede venir de datos externos (secuencias de
+        # escape, rutas). El traceback completo solo con RELI_SIDECAR_DEBUG.
+        _log(f"handler crashed: {type(e).__name__}")
+        if os.environ.get("RELI_SIDECAR_DEBUG"):
+            _log(traceback.format_exc())
         if is_notification:
             return None
-        return _error_response(req_id, _INTERNAL_ERROR, f"internal error: {e}")
+        return _error_response(
+            req_id, _INTERNAL_ERROR, f"internal error ({type(e).__name__})"
+        )
 
     if is_notification:
         return None

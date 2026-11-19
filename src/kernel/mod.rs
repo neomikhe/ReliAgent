@@ -33,6 +33,16 @@ pub enum KernelError {
 
     #[error("bridge error: {0}")]
     Bridge(String),
+
+    /// El sidecar respondió con un objeto de error JSON-RPC. `code` y `data`
+    /// se conservan para que la CLI pueda dar instrucciones concretas
+    /// (ver `bridge::rpc_codes`).
+    #[error("sidecar error {code}: {message}")]
+    SidecarRpc {
+        code: i64,
+        message: String,
+        data: Option<serde_json::Value>,
+    },
 }
 
 pub type KernelResult<T> = Result<T, KernelError>;

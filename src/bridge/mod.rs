@@ -1,6 +1,6 @@
 //! Python sidecar bridge.
 //!
-//! Spawns the Python orchestrator (`python -m reliagent_python`) as a child
+//! Spawns the Python orchestrator (`python -I -m reliagent_python`) as a child
 //! process and speaks JSON-RPC 2.0 over stdin/stdout using NDJSON framing.
 //! There is intentionally no async runtime here — the kernel is a simple
 //! request/response consumer and blocking I/O keeps the implementation
@@ -23,17 +23,43 @@ use crate::kernel::{KernelError, KernelResult};
 
 use jsonrpc::{RpcRequest, RpcResponse};
 
-/// How the sidecar is invoked. `Module` uses `python -m reliagent_python`
+/// How the sidecar is invoked. `Module` uses `python -I -m reliagent_python`
 /// (the normal path). `ExplicitCommand` is used by tests that need to
 /// inject a fake sidecar binary.
 #[derive(Debug, Clone)]
 pub enum SidecarSpec {
-    /// Run `<python> -m reliagent_python`. The caller supplies the
+    /// Run `<python> -I -m reliagent_python` (isolated mode). The caller supplies the
     /// interpreter path; we do not try to guess it.
     Module { python: std::path::PathBuf },
     /// Run an arbitrary command. First element is the program, rest are
     /// args. Used for testing with fake sidecars.
     ExplicitCommand(Vec<String>),
+}
+
+/// Which LLM the sidecar uses for `agent.run`. Serialised as the
+/// `backend` param (`"ollama"` / `"mock"`). There is no default on the wire:
+/// the caller always chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmBackend {
+    /// Local Ollama daemon with the pinned, hash-verified model.
+    Ollama,
+    /// Deterministic pattern-matching agent (tests and offline demos).
+    Mock,
+}
+
+/// Application error codes returned by the sidecar. Mirror of the
+/// `RPC_*` constants in `python-core/src/reliagent_python/main.py`; the
+/// `rpc_codes_match_python_sidecar` test keeps both in sync.
+pub mod rpc_codes {
+    /// Nothing listening on 127.0.0.1:11434.
+    pub const OLLAMA_UNREACHABLE: i64 = -32010;
+    /// Ollama lacks the pinned model tag. `data.model` names it.
+    pub const MODEL_MISSING: i64 = -32011;
+    /// The blob Ollama would use is not the pinned weights.
+    pub const MODEL_INTEGRITY: i64 = -32012;
+    /// Ollama failed during generation.
+    pub const LLM_ERROR: i64 = -32013;
 }
 
 /// Result of one `agent.run` call. Mirrors the Python dataclass
@@ -68,7 +94,12 @@ impl Bridge {
         let mut cmd = match spec {
             SidecarSpec::Module { python } => {
                 let mut c = Command::new(python);
-                c.arg("-m").arg("reliagent_python");
+                // -I (modo aislado): ni el cwd ni PYTHONPATH/PYTHON* ni el
+                // site-packages del usuario entran en sys.path. Ejecutar
+                // `reli` dentro de un directorio hostil no debe cargar su
+                // código; el paquete tiene que estar instalado en el
+                // intérprete elegido.
+                c.arg("-I").arg("-m").arg("reliagent_python");
                 c
             }
             SidecarSpec::ExplicitCommand(parts) => {
@@ -145,10 +176,11 @@ impl Bridge {
         let response: RpcResponse = serde_json::from_str(line.trim())
             .map_err(|e| KernelError::Bridge(format!("decode response: {e}: {line:?}")))?;
         if let Some(err) = response.error {
-            return Err(KernelError::Bridge(format!(
-                "sidecar error {}: {}",
-                err.code, err.message
-            )));
+            return Err(KernelError::SidecarRpc {
+                code: err.code,
+                message: err.message,
+                data: err.data,
+            });
         }
         let result = response
             .result
@@ -174,8 +206,8 @@ impl Bridge {
     /// Run the agent/critic loop for a single user prompt. The returned
     /// `AgentRunResult` is a *proposal* — the kernel still decides whether
     /// to execute.
-    pub fn agent_run(&mut self, prompt: &str) -> KernelResult<AgentRunResult> {
-        let params = serde_json::json!({ "prompt": prompt });
+    pub fn agent_run(&mut self, prompt: &str, backend: LlmBackend) -> KernelResult<AgentRunResult> {
+        let params = serde_json::json!({ "prompt": prompt, "backend": backend });
         self.call("agent.run", &params)
     }
 

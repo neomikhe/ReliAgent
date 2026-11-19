@@ -68,6 +68,28 @@ cargo test -- --ignored                 # real sidecar bridge, needs venv
 cd python-core && uv run pytest && cd ..
 ```
 
+The bridge tests spawn `python` (Windows) or `python3` (elsewhere). If
+that is not a real interpreter — e.g. the Microsoft Store alias on
+Windows — point them at the venv:
+
+```bash
+RELI_TEST_PYTHON="$PWD/python-core/.venv/Scripts/python.exe" cargo test   # Windows (Git Bash)
+RELI_TEST_PYTHON="$PWD/python-core/.venv/bin/python" cargo test           # Linux/macOS
+```
+
+If you move the checkout to another directory, run `cargo clean` and
+re-create the venv (`rm -rf python-core/.venv && uv sync`): test binaries
+embed the old absolute path and fail with "directory name is invalid".
+
+None of the tests need Ollama; they use a local fake server.
+
+`reli` starts the sidecar as `python -I -m reliagent_python` (isolated
+mode: the current directory and `PYTHONPATH` are not on `sys.path`), so
+the package must be installed in the interpreter you pass with
+`--python` — `uv sync` in `python-core/` does that for the venv. To see
+full Python tracebacks from the sidecar while debugging, set
+`RELI_SIDECAR_DEBUG=1`; by default it only logs the exception type.
+
 Red-team suite specifically:
 
 ```bash

@@ -1,14 +1,13 @@
-"""LLM clients for the orchestrator.
+"""LLM client contract and deterministic clients for the orchestrator.
 
-Two implementations ship here:
-
+- `LLMClient`: the protocol the orchestrator depends on.
 - `MockOllamaClient`: deterministic pattern-matching agent used for tests and
-  offline smoke runs. Always the default.
-- `OllamaClient`: thin wrapper around the `ollama` Python package. Used when
-  the caller wires it explicitly. Not exercised in CI (would require a live
-  daemon at `localhost:11434`).
+  offline demos (`reli run --mock-llm`).
+- `MockCriticClient`: fixed-verdict critic for tests.
 
-Both clients return raw JSON strings — parsing/validation lives in the
+The real client lives in `ollama_http.OllamaClient`.
+
+All clients return raw JSON strings — parsing/validation lives in the
 orchestrator, not here.
 """
 
@@ -155,41 +154,3 @@ class MockCriticClient:
         if self.verdict == "approve":
             return json.dumps({"verdict": "approve"})
         return json.dumps({"verdict": "reject", "reason": self.reason or "mock reject"})
-
-
-# --- Real Ollama --------------------------------------------------------
-
-
-class OllamaClient:
-    """Thin wrapper over the `ollama` package. Kept intentionally simple:
-    one-shot `chat` calls, no streaming, no tools API. Real integration work
-    lives in a later milestone.
-    """
-
-    def __init__(self, model: str = "qwen2.5:7b-instruct-q4_K_M", host: str | None = None):
-        # Import lazily so tests that only use the mock don't need ollama
-        # installed.
-        try:
-            import ollama  # type: ignore[import-not-found]
-        except ImportError as e:  # pragma: no cover - env-dependent
-            raise RuntimeError(
-                "The `ollama` package is required for OllamaClient. "
-                "Install it (pip install ollama) or use MockOllamaClient."
-            ) from e
-        self._ollama = ollama
-        self._model = model
-        self._host = host
-
-    def generate(self, system: str, user: str) -> str:  # pragma: no cover - network
-        client = (
-            self._ollama.Client(host=self._host) if self._host else self._ollama
-        )
-        resp = client.chat(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            options={"temperature": 0.0},
-        )
-        return resp["message"]["content"]

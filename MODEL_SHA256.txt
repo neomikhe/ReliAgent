@@ -1,19 +1,25 @@
-# Canonical model manifest — ReliAgent v0.1.0
+# Canonical model pin — ReliAgent v0.1.0
 #
-# One line per canonical artifact:
+# ReliAgent does not download the model itself. Ollama does:
 #
-#     <sha256 hex>  <filename>  <bytes>  <license-url>
+#     ollama pull qwen2.5:7b-instruct-q4_K_M
 #
-# Fields are separated by two spaces. Lines starting with "#" are comments.
-# The fetch_model.{sh,ps1} scripts parse only lines whose first field is a
-# 64-char hex digest.
+# The line below pins the *weights layer* (media type
+# application/vnd.ollama.image.model) of that tag's manifest on
+# registry.ollama.ai. Ollama stores it as `blobs/sha256-<digest>`.
 #
-# IMPORTANT — placeholder file.
-# The SHA-256 values below MUST be replaced with the real digest of the
-# exact GGUF file served by the mirror before cutting a public release.
-# Leaving them as "REPLACE_..." will cause fetch_model to refuse every
-# download, which is the correct failure mode.
+# On every `reli run`, the Python sidecar checks that Ollama (whatever
+# answers on 127.0.0.1:11434) serves the tag from this exact blob, with no
+# ADAPTER layers, and re-computes the SHA-256 of the file on disk. A
+# mismatch aborts the run before any inference happens.
+#
+# Format (fields separated by two spaces; lines starting with "#" are
+# comments):
+#
+#     <sha256 hex>  <ollama tag>  <bytes>  <licence url>
+#
+# This file mirrors CANONICAL_MODEL in
+# python-core/src/reliagent_python/model_integrity.py; a test fails if they
+# diverge.
 
-REPLACE_WITH_SHA256_64HEX_FOR_Q4_K_M  qwen2.5-7b-instruct-q4_k_m.gguf  0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE
-REPLACE_WITH_SHA256_64HEX_FOR_Q5_K_M  qwen2.5-7b-instruct-q5_k_m.gguf  0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE
-REPLACE_WITH_SHA256_64HEX_FOR_Q8_0    qwen2.5-7b-instruct-q8_0.gguf    0  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE
+2bada8a7450677000f678be90653b85d364de7db25eb5ea54136ada5f3933730  qwen2.5:7b-instruct-q4_K_M  4683073952  https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE

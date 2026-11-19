@@ -38,7 +38,7 @@ is a bug. Open an issue against this file in the same PR.
 | B | Integrity of the action log. | Linear HMAC-SHA256 chain over every recorded entry; `anchor.log` as external witness against truncation. |
 | C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, libsecret on Linux). Never written to disk in plaintext, never logged. |
 | D | Approval gate. | TTY prompt before any mutating proposal executes. In non-interactive mode or without a TTY, the default is **reject**. |
-| E | Privacy of the user. | Zero outbound network traffic from `reli` itself. The Python sidecar talks to Ollama on `localhost:11434` only. Model downloads are explicit, interactive, and optional. |
+| E | Privacy of the user. | Zero outbound network traffic from `reli` itself. The Python sidecar talks to Ollama on `127.0.0.1:11434` only: the host is hard-coded, and `OLLAMA_HOST`, proxy environment variables and HTTP redirects are ignored. Model downloads happen only when the user runs `ollama pull`. |
 
 ---
 
@@ -106,6 +106,26 @@ They are documented here so no user is surprised.
   Ollama binary can undermine everything above. Mitigations: pinned
   versions, `cargo --locked` in CI, SBOM + `cosign` signature on releases
   (tracked in §6 and the release workflow).
+- **Model substitution.** Every `reli run` refuses to infer unless the
+  server on `127.0.0.1:11434` reports a Modelfile with a single `FROM`
+  (no `ADAPTER`) pointing to the blob pinned in `MODEL_SHA256.txt`, that
+  path is a local absolute path inside a `blobs/` directory (never UNC or
+  device paths), and the file's SHA-256 still matches. Not covered:
+  Ollama's template/system/parameter layers for the tag; a model already
+  resident in Ollama's memory from before a swap; re-tagging between the
+  check and the inference (needs write access to Ollama's model store).
+- **Port squatting.** The check above verifies a *file*, not the process
+  answering on `127.0.0.1:11434`. If Ollama is not running, **any local
+  account** — not only code running as the user — can bind that port,
+  point the check at the genuine blob, and then receive every prompt and
+  dictate the agent's and the critic's answers. What it cannot do is
+  bypass the Rust policy engine or the TTY approval: its proposals go
+  through the same gates as Ollama's. On shared machines, keep Ollama
+  running (or bound) before using `reli run`.
+- **The LLM critic is not independent.** It is the same model and client
+  as the agent, so a prompt injection that steers the agent can steer the
+  critic too. It is defence in depth on top of the deterministic critic
+  and the Rust policy engine, never a replacement.
 - **Side channels on the keyring.** Memory scraping, debugger attach,
   weaknesses in the OS keyring implementation itself.
 - **Linux without libsecret.** Fallback to a local encrypted file is a

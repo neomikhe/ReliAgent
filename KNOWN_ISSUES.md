@@ -115,18 +115,63 @@ directory. Use the native binary.
 
 ## Model and dependencies
 
-### Qwen2.5 licence is **not** Apache-2.0
+### The model comes from Ollama and is verified on every run
 
-The default canonical model is
-[Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) (or
-the GGUF build thereof). Its licence is Qwen's own, not Apache-2.0. By
-downloading the model you accept Qwen's terms separately from accepting
-ReliAgent's Apache-2.0 licence.
+ReliAgent does not download model weights. You fetch them with Ollama:
 
-The download script (`scripts/fetch_model.{ps1,sh}`) shows the licence URL
-and requires an explicit confirmation before fetching. We ship the
-SHA-256 in [`MODEL_SHA256.txt`](MODEL_SHA256.txt); any future canonical
-model change will bump that file and appear in release notes.
+```bash
+ollama pull qwen2.5:7b-instruct-q4_K_M
+```
+
+[`MODEL_SHA256.txt`](MODEL_SHA256.txt) pins the SHA-256 of that tag's
+weights layer as published on `registry.ollama.ai`. Before any inference,
+`reli run`:
+
+1. asks Ollama (`/api/show`) which blob it serves the tag from, and refuses
+   unless the Modelfile has exactly one `FROM`, no `ADAPTER`, and the blob
+   digest is the pinned one;
+2. refuses unless the blob path is a local absolute path inside a `blobs/`
+   directory (UNC and device paths are rejected before touching the file
+   system);
+3. re-computes the SHA-256 of that blob file on disk (~5 s for 4.7 GB on an
+   SSD) and refuses on mismatch.
+
+Limits of this check, stated plainly:
+
+- **Only the weights are pinned.** Ollama's prompt template, system prompt
+  and default parameters for the tag are separate layers and are not
+  verified.
+- **It verifies a file, not the server.** If Ollama is not running, any
+  local account can listen on `127.0.0.1:11434`, pass the check by
+  pointing at the genuine blob, and receive your prompts. It still cannot
+  bypass the policy engine or the approval prompt. See
+  [THREAT_MODEL.md §4](docs/THREAT_MODEL.md#4-residual-risk).
+- **Time-of-check gap.** If Ollama already has the model loaded in memory
+  (it keeps it for a few minutes after use), a blob swapped *and then
+  reverted* between runs would not be noticed, nor would a re-tag between
+  the check and the inference. Re-hashing every run makes this window
+  small, not zero.
+- **The blob must be readable by your user.** Linux service installs keep
+  models under `/usr/share/ollama/.ollama/models`, owned by the `ollama`
+  user. If your user cannot read the blob, `reli run` stops with a
+  model-integrity error rather than skipping the check. Grant read access
+  to the blob or run Ollama as your user.
+- `reli run --mock-llm` skips Ollama and the model entirely (deterministic
+  test agent). Use it only for demos and tests.
+
+### Model licence
+
+Qwen2.5-7B-Instruct is published under the
+[Apache License 2.0](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/LICENSE),
+the same licence as ReliAgent; Ollama ships that licence text as a layer of
+the tag. Other Qwen2.5 sizes (e.g. 3B, 72B) use different licences — if
+you change the canonical model, re-check its terms.
+
+### CPU-only inference is slow
+
+On a machine without a supported GPU, one `reli run` (agent + LLM critic,
+two inferences) takes about a minute with the 7B model. This is Ollama's
+inference speed, not ReliAgent overhead.
 
 ### Ollama telemetry
 
@@ -139,10 +184,14 @@ version.
 ### No outbound network from `reli` itself
 
 The Rust binary makes **zero** outbound network calls. The Python sidecar
-only speaks to `http://127.0.0.1:11434` (Ollama's loopback interface).
-Model downloads happen only in the explicitly-invoked fetch scripts, not
-during normal operation. If you see `reli` making any other network call,
-that is a bug — please file a CVE, not a regular issue.
+only speaks to `http://127.0.0.1:11434` (Ollama's loopback interface): the
+host is hard-coded, and `OLLAMA_HOST`, proxy variables (`HTTP_PROXY`,
+`ALL_PROXY`, ...) and HTTP redirects are ignored on purpose. To use Ollama
+on another port or machine you would have to change the code — that is
+by design. Model downloads happen only when you run `ollama pull`
+yourself. If you see `reli` making any other network call, that is a bug —
+please report it as a vulnerability (see [`SECURITY.md`](SECURITY.md)), not
+as a regular issue.
 
 ---
 

@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 
 use reliagent::approval::{self, ApprovalDecision, ApprovalMode};
-use reliagent::bridge::{AgentRunResult, Bridge, SidecarSpec};
+use reliagent::bridge::{AgentRunResult, Bridge, LlmBackend, SidecarSpec, rpc_codes};
 use reliagent::kernel::audit::AuditStatus;
 use reliagent::kernel::keyring;
 use reliagent::kernel::sandbox::Sandbox;
@@ -95,12 +95,18 @@ enum Command {
     },
     /// Corre el orquestador Python con un prompt y, si el crítico aprueba,
     /// pide confirmación por TTY y ejecuta la propuesta dentro del sandbox.
+    /// Usa Ollama en 127.0.0.1:11434 con el modelo fijado en MODEL_SHA256.txt.
     Run {
         /// Prompt en lenguaje natural (p. ej. "write 'hola' to notes/hi.txt")
         prompt: String,
         /// No ejecutar la propuesta — solo mostrarla.
         #[arg(long)]
         dry_run: bool,
+        /// Usar el agente determinista de pruebas en lugar de Ollama (no
+        /// requiere Ollama ni el modelo; solo entiende frases simples como
+        /// "write 'x' to a.txt", "read a.txt" o "list").
+        #[arg(long)]
+        mock_llm: bool,
     },
     /// Diagnóstico: lanza el sidecar Python y envía un `ping`.
     Ping,
@@ -219,7 +225,11 @@ pub fn run() -> i32 {
             non_interactive,
         ),
         Command::Ping => run_ping(&python, &python_cwd),
-        Command::Run { prompt, dry_run } => run_agent(
+        Command::Run {
+            prompt,
+            dry_run,
+            mock_llm,
+        } => run_agent(
             &sandbox_path,
             &audit_dir,
             &python,
@@ -227,6 +237,7 @@ pub fn run() -> i32 {
             &prompt,
             dry_run,
             non_interactive,
+            llm_backend(mock_llm),
         ),
     }
 }
@@ -258,12 +269,92 @@ fn run_ping(python: &Path, python_cwd: &Path) -> i32 {
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] ping falló: {e}");
+            eprintln!("[reli] ping falló: {}", error_text(&e));
             EXIT_BRIDGE
         }
     }
 }
 
+/// Escapa los caracteres que la terminal interpretaría: controles C0/C1,
+/// DEL y caracteres de formato/bidi. Todo texto que venga del sidecar, del
+/// LLM o del sistema de archivos pasa por aquí antes de imprimirse, para
+/// que nadie pueda borrar la pantalla, falsificar mensajes, crear enlaces
+/// OSC 8 o escribir en el portapapeles (OSC 52).
+fn sanitize_for_terminal(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let unsafe_char = c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+        if unsafe_char {
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn error_text(e: &KernelError) -> String {
+    sanitize_for_terminal(&e.to_string())
+}
+
+fn llm_backend(mock_llm: bool) -> LlmBackend {
+    if mock_llm {
+        LlmBackend::Mock
+    } else {
+        LlmBackend::Ollama
+    }
+}
+
+/// Instrucciones para el usuario según el error de aplicación del sidecar.
+fn sidecar_hint(err: &KernelError) -> Option<String> {
+    let KernelError::SidecarRpc { code, data, .. } = err else {
+        return None;
+    };
+    let hint = match *code {
+        rpc_codes::OLLAMA_UNREACHABLE => "[reli] Ollama no detectado en 127.0.0.1:11434.\n\
+             [reli]   Instálalo desde https://ollama.com y arráncalo (app de escritorio u `ollama serve`).\n\
+             [reli]     Linux/macOS: curl -fsSL https://ollama.com/install.sh | sh\n\
+             [reli]     Windows: descarga el instalador desde https://ollama.com\n\
+             [reli]   Para probar sin Ollama: reli run --mock-llm \"<prompt>\""
+            .to_string(),
+        rpc_codes::MODEL_MISSING => {
+            let model = data
+                .as_ref()
+                .and_then(|d| d.get("model"))
+                .and_then(|m| m.as_str())
+                .filter(|m| is_safe_model_tag(m));
+            match model {
+                Some(m) => format!(
+                    "[reli] Ollama no tiene el modelo fijado. Descárgalo con:\n[reli]   ollama pull {m}"
+                ),
+                None => "[reli] Ollama no tiene el modelo fijado. Descarga la etiqueta indicada en MODEL_SHA256.txt con `ollama pull`.".to_string(),
+            }
+        }
+        rpc_codes::MODEL_INTEGRITY => "[reli] El modelo que sirve Ollama no coincide con el SHA-256 fijado en MODEL_SHA256.txt.\n\
+             [reli]   No se ejecutó ninguna inferencia. Vuelve a descargarlo (`ollama rm` + `ollama pull`);\n\
+             [reli]   si el error persiste, trátalo como una posible manipulación del modelo."
+            .to_string(),
+        rpc_codes::LLM_ERROR => {
+            "[reli] Ollama falló durante la generación. Revisa los logs de Ollama y reintenta."
+                .to_string()
+        }
+        _ => return None,
+    };
+    Some(hint)
+}
+
+/// Etiqueta de Ollama con caracteres seguros para mostrar en la terminal.
+fn is_safe_model_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 128
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_agent(
     sandbox_path: &Path,
     audit_dir: &Path,
@@ -272,22 +363,28 @@ fn run_agent(
     prompt: &str,
     dry_run: bool,
     non_interactive: bool,
+    backend: LlmBackend,
 ) -> i32 {
     let mut bridge = match spawn_bridge(python, python_cwd) {
         Ok(b) => b,
         Err(code) => return code,
     };
 
-    let result = match bridge.agent_run(prompt) {
+    let result = match bridge.agent_run(prompt, backend) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[reli] agent.run falló: {e}");
+            eprintln!("[reli] agent.run falló: {}", error_text(&e));
+            if let Some(hint) = sidecar_hint(&e) {
+                eprintln!("{hint}");
+            }
             return EXIT_BRIDGE;
         }
     };
     let _ = bridge.shutdown();
 
-    print_agent_result(&result);
+    for line in agent_result_lines(&result) {
+        println!("{line}");
+    }
 
     if result.verdict != "approve" {
         return EXIT_REJECTED;
@@ -326,20 +423,22 @@ fn run_agent(
     execute_proposal(sandbox_path, audit_dir, proposal)
 }
 
-fn print_agent_result(result: &AgentRunResult) {
-    println!("[reli] agente: verdict={}", result.verdict);
+/// Líneas a mostrar del resultado del agente, ya saneadas.
+fn agent_result_lines(result: &AgentRunResult) -> Vec<String> {
+    let mut lines = vec![format!("[reli] agente: verdict={}", result.verdict)];
     if !result.critic_stage.is_empty() {
-        println!("[reli] crítico: stage={}", result.critic_stage);
+        lines.push(format!("[reli] crítico: stage={}", result.critic_stage));
     }
     if !result.reason.is_empty() {
-        println!("[reli] motivo: {}", result.reason);
+        lines.push(format!("[reli] motivo: {}", result.reason));
     }
     if let Some(p) = &result.proposal {
-        println!("[reli] propuesta: {p}");
+        lines.push(format!("[reli] propuesta: {p}"));
     }
     for t in &result.trace {
-        println!("[reli] trace: {t}");
+        lines.push(format!("[reli] trace: {t}"));
     }
+    lines.iter().map(|l| sanitize_for_terminal(l)).collect()
 }
 
 fn render_proposal_summary(proposal: &serde_json::Value, result: &AgentRunResult) -> String {
@@ -349,8 +448,11 @@ fn render_proposal_summary(proposal: &serde_json::Value, result: &AgentRunResult
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
     format!(
-        "[reli] propuesta a ejecutar\n  tool: {tool}\n  args: {args}\n  critic: {} ({})",
-        result.verdict, result.critic_stage
+        "[reli] propuesta a ejecutar\n  tool: {}\n  args: {}\n  critic: {} ({})",
+        sanitize_for_terminal(tool),
+        sanitize_for_terminal(&args),
+        sanitize_for_terminal(&result.verdict),
+        sanitize_for_terminal(&result.critic_stage)
     )
 }
 
@@ -441,13 +543,13 @@ fn run_write(sandbox_path: &Path, audit_dir: &Path, path: &str, content: &str) -
             println!(
                 "[reli] ok: {} bytes escritos en {}",
                 content.len(),
-                sandbox.root_path().join(path).display()
+                sanitize_for_terminal(&sandbox.root_path().join(path).display().to_string())
             );
             println!("[reli] audit hmac: {record_hmac}");
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] rechazado: {e}");
+            eprintln!("[reli] rechazado: {}", error_text(&e));
             eprintln!("[reli] audit hmac: {record_hmac}");
             kernel_error_exit(&e)
         }
@@ -498,12 +600,16 @@ fn run_read(sandbox_path: &Path, audit_dir: &Path, path: &str) -> i32 {
                 return EXIT_BAD_INPUT;
             }
             let _ = handle.flush();
-            eprintln!("[reli] ok: {} bytes leídos de {}", bytes.len(), path);
+            eprintln!(
+                "[reli] ok: {} bytes leídos de {}",
+                bytes.len(),
+                sanitize_for_terminal(path)
+            );
             eprintln!("[reli] audit hmac: {record_hmac}");
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] rechazado: {e}");
+            eprintln!("[reli] rechazado: {}", error_text(&e));
             eprintln!("[reli] audit hmac: {record_hmac}");
             kernel_error_exit(&e)
         }
@@ -545,28 +651,28 @@ fn run_ls(sandbox_path: &Path, audit_dir: &Path, path: &str) -> i32 {
 
     match result {
         Ok(entries) => {
-            print_entries(&entries);
+            for entry in &entries {
+                println!("{}", entry_line(entry));
+            }
             eprintln!("[reli] ok: {} entradas", entries.len());
             eprintln!("[reli] audit hmac: {record_hmac}");
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] rechazado: {e}");
+            eprintln!("[reli] rechazado: {}", error_text(&e));
             eprintln!("[reli] audit hmac: {record_hmac}");
             kernel_error_exit(&e)
         }
     }
 }
 
-fn print_entries(entries: &[DirEntry]) {
-    for e in entries {
-        let marker = match e.kind {
-            DirEntryKind::Dir => "d",
-            DirEntryKind::File => "-",
-            DirEntryKind::Other => "?",
-        };
-        println!("{marker} {}", e.name);
-    }
+fn entry_line(e: &DirEntry) -> String {
+    let marker = match e.kind {
+        DirEntryKind::Dir => "d",
+        DirEntryKind::File => "-",
+        DirEntryKind::Other => "?",
+    };
+    format!("{marker} {}", sanitize_for_terminal(&e.name))
 }
 
 fn run_verify(audit_dir: &Path) -> i32 {
@@ -749,4 +855,171 @@ fn wipe_dir_contents(dir: &Path) -> std::io::Result<usize> {
         removed += 1;
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ningún carácter que la terminal pueda interpretar como control.
+    fn assert_terminal_safe(s: &str) {
+        for c in s.chars() {
+            assert!(
+                !c.is_control()
+                    && !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
+                "unsafe char {:?} in {s:?}",
+                c
+            );
+        }
+    }
+
+    const HOSTILE: &str = "a\u{1b}]52;c;aGk=\u{7}b\u{1b}[2Jc\u{9b}d\u{7f}e\u{202e}f\u{200b}g\nh\ri";
+
+    #[test]
+    fn sanitize_escapes_control_and_bidi_chars() {
+        let out = sanitize_for_terminal(HOSTILE);
+        assert_terminal_safe(&out);
+        assert!(out.contains("\\u{1b}"), "{out}");
+        assert!(out.contains("\\u{202e}"), "{out}");
+    }
+
+    #[test]
+    fn sanitize_keeps_plain_text_untouched() {
+        let s = "ñandú café — notes/a b.txt 123 [ok] {\"k\":1}";
+        assert_eq!(sanitize_for_terminal(s), s);
+    }
+
+    #[test]
+    fn agent_result_lines_are_terminal_safe() {
+        let result = AgentRunResult {
+            proposal: Some(serde_json::json!({"tool": null, "reason": HOSTILE})),
+            verdict: format!("reject{HOSTILE}"),
+            reason: HOSTILE.into(),
+            agent_raw: String::new(),
+            critic_stage: HOSTILE.into(),
+            trace: vec![HOSTILE.into()],
+        };
+        let lines = agent_result_lines(&result);
+        assert!(lines.len() >= 5);
+        lines.iter().for_each(|l| assert_terminal_safe(l));
+    }
+
+    #[test]
+    fn proposal_summary_is_terminal_safe() {
+        let result = AgentRunResult {
+            proposal: None,
+            verdict: "approve".into(),
+            reason: String::new(),
+            agent_raw: String::new(),
+            critic_stage: HOSTILE.into(),
+            trace: vec![],
+        };
+        let proposal = serde_json::json!({"tool": HOSTILE, "args": {"path": HOSTILE}});
+        let summary = render_proposal_summary(&proposal, &result);
+        summary.lines().for_each(assert_terminal_safe);
+    }
+
+    #[test]
+    fn error_lines_are_terminal_safe() {
+        let err = KernelError::SidecarRpc {
+            code: -32012,
+            message: HOSTILE.into(),
+            data: None,
+        };
+        assert_terminal_safe(&error_text(&err));
+        let err = KernelError::PathOutsideSandbox {
+            path: HOSTILE.into(),
+        };
+        assert_terminal_safe(&error_text(&err));
+    }
+
+    #[test]
+    fn dir_entry_names_are_terminal_safe() {
+        let entry = DirEntry {
+            name: HOSTILE.into(),
+            kind: DirEntryKind::File,
+        };
+        assert_terminal_safe(&entry_line(&entry));
+    }
+
+    fn parse_run(args: &[&str]) -> (String, bool) {
+        let cli = Cli::try_parse_from(args).expect("valid args");
+        match cli.command {
+            Command::Run {
+                prompt, mock_llm, ..
+            } => (prompt, mock_llm),
+            _ => panic!("expected run"),
+        }
+    }
+
+    fn rpc_error(code: i64, data: Option<serde_json::Value>) -> KernelError {
+        KernelError::SidecarRpc {
+            code,
+            message: "x".into(),
+            data,
+        }
+    }
+
+    #[test]
+    fn run_uses_ollama_by_default() {
+        let (prompt, mock_llm) = parse_run(&["reli", "run", "hola"]);
+        assert_eq!(prompt, "hola");
+        assert!(!mock_llm);
+        assert_eq!(llm_backend(mock_llm), LlmBackend::Ollama);
+    }
+
+    #[test]
+    fn mock_llm_flag_selects_mock_backend() {
+        let (_, mock_llm) = parse_run(&["reli", "run", "--mock-llm", "hola"]);
+        assert!(mock_llm);
+        assert_eq!(llm_backend(mock_llm), LlmBackend::Mock);
+    }
+
+    #[test]
+    fn unreachable_hint_explains_install_and_mock() {
+        let hint = sidecar_hint(&rpc_error(rpc_codes::OLLAMA_UNREACHABLE, None)).unwrap();
+        assert!(hint.contains("127.0.0.1:11434"), "{hint}");
+        assert!(hint.contains("https://ollama.com"), "{hint}");
+        assert!(hint.contains("--mock-llm"), "{hint}");
+    }
+
+    #[test]
+    fn missing_model_hint_names_pull_command() {
+        let data =
+            serde_json::json!({"kind": "model_missing", "model": "qwen2.5:7b-instruct-q4_K_M"});
+        let hint = sidecar_hint(&rpc_error(rpc_codes::MODEL_MISSING, Some(data))).unwrap();
+        assert!(
+            hint.contains("ollama pull qwen2.5:7b-instruct-q4_K_M"),
+            "{hint}"
+        );
+    }
+
+    #[test]
+    fn missing_model_hint_ignores_unsafe_model_names() {
+        // El nombre viene del sidecar; nunca se imprime algo que no parezca
+        // una etiqueta de Ollama (p. ej. secuencias de escape de terminal).
+        let data = serde_json::json!({"model": "x\u{1b}[2J; rm -rf ~"});
+        let hint = sidecar_hint(&rpc_error(rpc_codes::MODEL_MISSING, Some(data))).unwrap();
+        assert!(!hint.contains('\u{1b}'), "{hint:?}");
+        assert!(!hint.contains("rm -rf"), "{hint}");
+        assert!(hint.contains("MODEL_SHA256.txt"), "{hint}");
+    }
+
+    #[test]
+    fn integrity_hint_says_nothing_ran() {
+        let hint = sidecar_hint(&rpc_error(rpc_codes::MODEL_INTEGRITY, None)).unwrap();
+        assert!(hint.contains("MODEL_SHA256.txt"), "{hint}");
+        assert!(hint.contains("ninguna inferencia"), "{hint}");
+    }
+
+    #[test]
+    fn llm_error_has_hint() {
+        assert!(sidecar_hint(&rpc_error(rpc_codes::LLM_ERROR, None)).is_some());
+    }
+
+    #[test]
+    fn other_errors_have_no_hint() {
+        assert!(sidecar_hint(&rpc_error(-32603, None)).is_none());
+        assert!(sidecar_hint(&KernelError::Bridge("x".into())).is_none());
+    }
 }
