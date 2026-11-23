@@ -116,10 +116,10 @@ keyring error: platform secure storage failure: SS: NoKeyringDaemon
 - **Workaround in v0.1:** install and start a Secret Service provider,
   e.g. `gnome-keyring` inside a D-Bus session
   (`dbus-run-session -- ...`).
-- **Planned fallback (v0.2):** an encrypted file at `~/.reliagent/hmac.enc`
-  with permissions `0600`, derived from a passphrase on first run. This
-  is a strict downgrade versus the native keyring — documented as such
-  and gated behind a `--no-keyring` flag.
+- **No fallback in v0.1:** without a Secret Service `reli` refuses to
+  run (exit code `3`) instead of keeping the HMAC key somewhere weaker.
+  A file-based fallback is still an open question for v0.2; if it comes,
+  it will be opt-in and documented as a downgrade.
 
 ### Flatpak / Snap confinement
 
@@ -145,6 +145,56 @@ running, or on a copy of the files.
 
 Keep `~/.reliagent/` on a local disk. SQLite's locks are unreliable on
 network file systems (SMB, NFS).
+
+### A log that fails verification: read-only mode
+
+When verification fails, `reli` names the first bad entry and from then
+on every command that opens the log refuses to run (exit code `3`):
+`run`, `write`, `read`, `ls`, `verify` and `sandbox status`. Nothing is
+repaired automatically and there is no `--force`. What still works:
+
+- `reli log > export.jsonl` prints every entry exactly as stored (also
+  the tampered ones) and then says on stderr where verification fails.
+  It reads through a read-only connection without a checkpoint on close,
+  so it never modifies the log, creates a key, anchor or witness, or
+  migrates an old database (SQLite may leave an empty `audit.db-shm`
+  next to it).
+- `reli reset --wipe-everything` starts over once you have what you need.
+
+`reli log` refuses to export, and asks you to analyse a copy instead,
+when the database contains anything `reli` never creates (a view, a
+trigger, another table, an extra column, a value over 1 MiB), or when
+SQLite would rewrite the files just to read them (a pending
+`audit.db-journal`, or an `audit.db-wal` next to an empty `audit.db`).
+Copy the whole audit directory before investigating further.
+
+While `reli log` is reading — for example piped into a pager — other
+`reli` commands report the log as in use (exit code `6`).
+
+Before sharing an export, note that `args_hash` is a plain SHA-256 of
+`{"path":…,"bytes":…}` ([HASH_FORMAT.md §3](docs/HASH_FORMAT.md)): a
+path that can be guessed can be confirmed from it.
+
+### Audit files are private on Linux and macOS
+
+`reli` creates the audit directory (`~/.reliagent/` by default) and its
+`anchors/` with mode `0700`: the log holds the paths and times of
+everything the agent did. A directory that already existed keeps its
+mode; `reli` warns when other users can read or write it (run `chmod 700`
+on it, e.g. if an older build created it).
+
+On Windows the default `%USERPROFILE%\.reliagent` inherits the private
+permissions of your profile, but `reli` sets no ACL of its own: a custom
+`--audit-dir` inherits whatever its parent allows (directly under `C:\`,
+for instance, every local user may modify subfolders). Keep the audit
+directory inside your profile.
+
+### The very first run creates the HMAC key
+
+The key is created the first time any `reli` command needs it. Two
+`reli` processes started at exactly that moment on a machine with no key
+yet may each create one; the log of the one that lost then never
+verifies. Run the first command on a new machine on its own.
 
 ### `abandoned` entries
 
@@ -187,12 +237,37 @@ Each action commits two entries with `synchronous = FULL` (a disk flush
 each; `F_FULLFSYNC` on macOS), so the log survives power loss. Expect a
 few milliseconds per action on an SSD, more on slow disks.
 
-### `reli read` on a terminal
+### `reli read` and `reli log` on a terminal
 
 When stdout is a terminal, `reli read` escapes control characters (escape
 sequences, `\r`, …) and replaces invalid UTF-8, because the file may have
 been written by the model. Newlines and tabs are kept. Pipe or redirect
-the output (`reli read a.bin > a.bin`) to get the exact bytes.
+the output (`reli read a.bin > a.bin`) to get the exact bytes. `reli log`
+always writes control and invisible characters as JSON escapes, on a
+terminal or not (the log may have been tampered with), so its output is
+valid JSON Lines that is safe to `cat`, `grep` or `jq` later.
+
+### File names with control or invisible characters are refused
+
+Paths containing control characters (including tab and newline) or
+characters that render as nothing — bidi controls such as U+202E,
+zero-width characters and joiners, the soft hyphen, Hangul fillers,
+variation selectors, invisible "tag" characters (U+E0000 block, which a
+model reads but a human does not see), a BOM or Unicode line separators —
+are rejected for every tool (`invalid path`). The agent can neither
+create nor read such a file, and a name can never look different in the
+approval prompt from what it is. Rename files like that by hand if you
+need `reli` to reach them.
+
+Ordinary Unicode (accents, CJK, most emoji) is fine. The cost: names that
+need a joiner or a variation selector are refused too: emoji written
+with a variation selector (the red heart) or a zero-width joiner
+(family or profession sequences), and some Persian, Urdu or Indic names.
+
+Not covered: two names that differ only in Unicode normalization (NFC
+vs NFD "café") are different files on Windows and Linux and look the
+same; on Windows, names ending in a dot or a space are created as given,
+and other Windows tools later strip that ending.
 
 ---
 
@@ -348,10 +423,13 @@ so users do not mistake them for regressions.
 
 | Limitation | Planned in |
 |---|---|
-| No per-session file quota enforcement (`SessionQuotaExceeded`). | v0.2 |
+| One action per `reli` process: each `run`, `write`, `read` or `ls` performs at most one action, so there are no multi-action sessions yet — hence no per-session file quota (`SessionQuotaExceeded`) and no session id in log entries (each action is still linked to its outcome through `resolves`). | v0.2 (sessions) |
 | No `grant_scope` tool (pre-approval with duration + path prefix). | v0.2 |
-| `args_hash` is **not** JCS-canonical (RFC 8785). | v0.2 |
-| No read allowlist for paths outside the sandbox (today: blanket deny). | v0.2 |
+| The approval prompt is `y/N` only. `always-for-this-path` arrives with `grant_scope`; `abort` would be the same as `N` while each run proposes a single action. | v0.2 |
+| No read allowlist for paths outside the sandbox: reading outside is always refused, never offered for approval. | v0.2 |
+| `args_hash` does not depend on how a proposal is spelled, but its bytes are not byte-exact RFC 8785 (JCS): `write_file` signs `path` before `bytes` (see [HASH_FORMAT.md §3](docs/HASH_FORMAT.md)). | Next hash format version |
+| No configuration file: everything is a flag or an environment variable (`--sandbox`, `--audit-dir`, `--python`, `RELI_PYTHON`). | v0.2+ |
+| No keyring fallback on Linux without a Secret Service (`reli` refuses to run). | Open question |
 | No Tauri GUI. CLI only. | v0.2+ |
 | No code-execution tool (`execute_code`). | v0.3 (WASI-Python / RustPython) |
 | No HTTP tool (`http_get`) with domain allowlist. | v0.2 |

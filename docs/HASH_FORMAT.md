@@ -18,7 +18,7 @@
 
 | What | Where |
 |---|---|
-| Audit database | `~/.reliagent/audit.db` (SQLite) |
+| Audit database | `~/.reliagent/audit.db` (SQLite). On Linux/macOS `reli` creates the directory `0700` |
 | Backup taken before the v1→v2 migration | `~/.reliagent/audit.db.schema1.bak` |
 | Rolling anchor log | `~/.reliagent/anchors/anchor.log`, rotated to `anchor.log.1`, `anchor.log.2`, … |
 | HMAC key | OS keyring, `service = "reliagent"`, `account = "audit-hmac-v1"` |
@@ -35,8 +35,10 @@ Audit entries live in the `audit_entries` table. The schema is created by
 - `locking_mode = EXCLUSIVE`: one process uses the log at a time. Another
   `reli` waits about 2 s and exits with code `6`; other tools are blocked
   too. Run external verifiers while `reli` is not running.
-- No triggers and no views. `reli` refuses to open a database that has
-  any (§5.6).
+- Only `reli`'s own schema: the tables `audit_entries` (exactly the v1
+  or v2 columns) and `schema_meta`, and indexes on them. `reli` refuses
+  a database with anything else — triggers, views, other tables, extra
+  columns, values over 1 MiB (§5.6).
 
 ---
 
@@ -113,11 +115,16 @@ let bytes = serde_json::to_vec(args)?;
 let args_hash = hex::encode(Sha256::digest(&bytes));
 ```
 
-**Caveat.** `serde_json::to_vec` is not strict JCS (RFC 8785). For
-ReliAgent's own tool calls the bytes are deterministic because the
-argument types are fixed structs, but third-party integrations should not
-assume JCS semantics. See the `v15_jcs_canonicalization` test in
-`tests/red_team.rs`.
+**Canonical form.** The bytes above are the canonical form. They do not
+depend on how the proposal was spelled: the sidecar's JSON is parsed
+into a typed action and these structs are generated from it, so key
+order, whitespace, escapes (`\u0061` vs `a`) and unknown fields in the
+proposal make no difference
+(`cli::tests::different_spellings_of_a_proposal_are_audited_with_the_same_bytes`).
+String escaping is the same as RFC 8785 (JCS); the only difference from
+byte-exact JCS is member order (`write_file` writes `path` before
+`bytes`). Switching to strict JCS would change the signed bytes and is
+reserved for a future hash format version (red-team vector 15).
 
 ---
 
@@ -212,8 +219,10 @@ best-effort for resolutions. `reli reset --wipe-everything` deletes it.
 
 ### 5.6 Verification rules
 
-A log verifies when the database contains no triggers or views, and
-walking rows by ascending `sequence_no`:
+A log verifies when its schema is exactly `reli`'s (§1; `type`, `name`
+and `sql` of `sqlite_master` compared byte for byte, so a disguised
+trigger such as `type = 'TRIGGER'` is refused too), and walking rows by
+ascending `sequence_no`:
 
 1. `sequence_no` equals the row's position.
 2. `hash_format_version` is `1` or `2`.
@@ -237,10 +246,19 @@ a bug or someone holding the key.
 
 `AuditStore::verify` returns `Ok(())` or
 `Err(KernelError::AuditCorrupted { sequence_no, reason })` at the first
-inconsistency. In v0.1.0 `reli` then refuses every command that opens the
-log (exit code `3`); recovery is manual (forensics on a copy of the
-files, or `reli reset --wipe-everything`). Exit code `6` only means the
-log is in use by another process; it never indicates tampering.
+inconsistency. In v0.1.0 `reli` then enters **read-only mode**: every
+command that would act refuses (exit code `3`) and names that entry, and
+`reli log` still prints every row exactly as stored — one JSON object per
+line whose keys are always the ten v2 column names (`resolves_seq` is
+`null` for a v1 log) — followed by the verification result on stderr.
+Values that `reli` never writes are tagged instead of looking like normal
+ones: `{"blob_hex": …}`, `{"text_hex": …}` for text that is not UTF-8,
+`{"real": …}` for a non-finite number. Control and invisible characters
+are written as JSON escapes. `reli log` opens the database
+`query_only` and never migrates, repairs or extends it. Recovery is
+manual (forensics on the export or on a copy of the files, then
+`reli reset --wipe-everything`). Exit code `6` only means the log is in
+use by another process; it never indicates tampering.
 
 ---
 
@@ -334,6 +352,9 @@ def verify(db_path, key: bytes) -> None:
 
 ## 8. Change log
 
+- **Documentation — 2026-11-23** (format unchanged, still v2). `reli log`
+  and read-only mode (§5.7); canonical form of `args` stated precisely
+  (§3); private audit directory on Unix (§1).
 - **v2 — 2026-11-18.** Two rows per action (`pending` before acting, then
   `ok` / `error` / `rejected` with `resolves`). New statuses `pending` and
   `error`; `abandoned` closes orphaned `pending` rows; refusal reasons are

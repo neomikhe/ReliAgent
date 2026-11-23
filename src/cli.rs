@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use reliagent::approval::{self, ApprovalDecision, ApprovalMode};
 use reliagent::bridge::{AgentRunResult, Bridge, LlmBackend, SidecarSpec, rpc_codes};
 use reliagent::kernel::audit::{AuditStatus, SignedEntry};
+use reliagent::kernel::head::HeadWitness;
 use reliagent::kernel::keyring;
-use reliagent::kernel::policy::{MAX_FILE_SIZE, validate_write_path};
+use reliagent::kernel::policy::{MAX_FILE_SIZE, is_unsafe_char, validate_write_path};
 use reliagent::kernel::sandbox::Sandbox;
-use reliagent::kernel::store::{AuditStore, LogLock};
+use reliagent::kernel::store::{AuditStore, LogLock, LogReader};
 use reliagent::kernel::tools::{DirEntry, DirEntryKind};
 use reliagent::kernel::{KernelError, KernelResult, tools};
 
@@ -88,6 +89,11 @@ enum Command {
     },
     /// Verifica la integridad del audit log persistente (SQLite + anchor.log).
     Verify,
+    /// Muestra el audit log como JSON Lines (una entrada por línea) sin
+    /// modificar nada. Funciona aunque la verificación falle: es el modo
+    /// solo lectura para leer y exportar el log antes de investigar o de
+    /// `reli reset`.
+    Log,
     /// Borra completamente el estado del kernel: audit.db, anchors, sandbox
     /// y la clave HMAC en el keyring. Requiere `--wipe-everything`.
     Reset {
@@ -443,18 +449,42 @@ fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     let anchor_dir = audit_dir.join("anchors");
     let opened = keyring::KeyringHead::for_log(&db_path)
         .and_then(|head| AuditStore::open_with_head(&db_path, &anchor_dir, key, Box::new(head)));
+    warn_if_audit_dir_is_shared(audit_dir);
     opened.map_err(|e| {
         // El texto puede venir del propio archivo (manipulado): se sanea.
         eprintln!("[reli] error inicializando audit store: {}", error_text(&e));
         if matches!(e, KernelError::AuditCorrupted { .. }) {
             eprintln!(
-                "[reli] el log no supera la verificación; si borraste ~/.reliagent a mano, \
-                 usa `reli reset --wipe-everything`"
+                "[reli] el log no supera la verificación: no se ejecuta ninguna acción. \
+                 `reli log` lo muestra y exporta sin modificarlo; si borraste ~/.reliagent \
+                 a mano, usa `reli reset --wipe-everything`"
             );
         }
         store_error_exit(&e)
     })
 }
+
+/// En Unix `reli` crea el directorio del log 0700, pero no cambia uno que ya
+/// existía (de una versión anterior, o un `--audit-dir` compartido): si otros
+/// usuarios pueden leerlo o escribir en él, se avisa.
+#[cfg(unix)]
+fn warn_if_audit_dir_is_shared(audit_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(audit_dir) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "[reli] aviso: {} tiene permisos {mode:o}: otros usuarios pueden ver (o \
+             tocar) el log. Usa `chmod 700` sobre ese directorio",
+            shown_path(audit_dir)
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_audit_dir_is_shared(_audit_dir: &Path) {}
 
 /// Código de salida de un error al abrir o usar el log.
 fn store_error_exit(e: &KernelError) -> i32 {
@@ -526,6 +556,7 @@ pub fn run() -> i32 {
             || ApprovalDecision::Approved,
         ),
         Command::Verify => run_verify(&audit_dir),
+        Command::Log => run_log(&audit_dir),
         Command::Reset {
             wipe_everything,
             force,
@@ -628,9 +659,8 @@ fn escape_unsafe_chars(s: &str, keep: &[char]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        let unsafe_char = (c.is_control() && !keep.contains(&c))
-            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
-        if unsafe_char {
+        // Mismo conjunto que las rutas del sandbox (policy::is_unsafe_char).
+        if is_unsafe_char(c) && !keep.contains(&c) {
             let _ = write!(out, "\\u{{{:x}}}", c as u32);
         } else {
             out.push(c);
@@ -1203,6 +1233,152 @@ fn run_verify(audit_dir: &Path) -> i32 {
     }
 }
 
+/// `reli log`: modo solo lectura. Exporta las filas tal como están (también
+/// las de un log manipulado) y después dice si el log es íntegro. No crea
+/// nada: ni el log, ni una clave HMAC, ni anchors o testigos.
+fn run_log(audit_dir: &Path) -> i32 {
+    let db_path = audit_dir.join("audit.db");
+    // `exists()` daría "no hay log" también ante un error de permisos.
+    match db_path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return report_missing_log(audit_dir, &db_path),
+        Err(e) => {
+            eprintln!("[reli] no se pudo comprobar {}: {e}", shown_path(&db_path));
+            return EXIT_AUDIT;
+        }
+    }
+    warn_if_audit_dir_is_shared(audit_dir);
+    let reader = match LogReader::open(&db_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[reli] no se pudo abrir el log: {}", error_text(&e));
+            return store_error_exit(&e);
+        }
+    };
+    // Errores de escritura (Io) son de la salida; el resto, de leer el log.
+    let output = match print_log_rows(&reader) {
+        Err(e) if !matches!(e, KernelError::Io(_)) => {
+            eprintln!("[reli] no se pudo leer el log: {}", error_text(&e));
+            eprintln!(
+                "[reli] copia {} (y su directorio) para analizarlo",
+                shown_path(&db_path)
+            );
+            return store_error_exit(&e);
+        }
+        other => other,
+    };
+    let verdict = report_log_integrity(&reader, &db_path, &audit_dir.join("anchors"));
+    match output {
+        // `reli log | head`: se cerró la salida, no es un fallo del log.
+        Err(KernelError::Io(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => {
+            eprintln!("[reli] error escribiendo la salida, export incompleto: {e}");
+            if verdict == EXIT_OK {
+                EXIT_BAD_INPUT
+            } else {
+                verdict
+            }
+        }
+        _ => verdict,
+    }
+}
+
+/// Sin `audit.db`: o todavía no hay log, o lo borraron. Lo distinguen el
+/// testigo del llavero (también si falta el directorio entero) y los
+/// anchors que hayan quedado. No crea nada.
+fn report_missing_log(audit_dir: &Path, db_path: &Path) -> i32 {
+    let anchors_left = std::fs::read_dir(audit_dir.join("anchors"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    let witness = keyring::KeyringHead::for_log_without_creating(db_path).and_then(|h| h.load());
+    match witness {
+        Ok(None) if !anchors_left => {
+            eprintln!("[reli] no hay audit log en {}", shown_path(db_path));
+            EXIT_OK
+        }
+        Ok(None) => {
+            eprintln!(
+                "[reli] falta {}, pero quedan sus anchors: lo borraron o lo movieron",
+                shown_path(db_path)
+            );
+            EXIT_AUDIT
+        }
+        Ok(Some(head)) => {
+            eprintln!(
+                "[reli] falta {}, pero el testigo del llavero dice que el log llegaba a la \
+                 entrada {}: lo borraron o lo movieron",
+                shown_path(db_path),
+                head.sequence_no
+            );
+            EXIT_AUDIT
+        }
+        Err(e) => {
+            eprintln!(
+                "[reli] no se pudo leer el testigo del llavero: {}",
+                error_text(&e)
+            );
+            EXIT_AUDIT
+        }
+    }
+}
+
+/// Una entrada por línea en JSON, igual a una terminal que a un pipe (ver
+/// `json_line`).
+fn print_log_rows(reader: &LogReader) -> KernelResult<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    reader.for_each_row(|row| writeln!(out, "{}", json_line(row)).map_err(KernelError::Io))?;
+    out.flush().map_err(KernelError::Io)
+}
+
+/// Una fila como una línea JSON con solo texto visible: cada carácter de
+/// `is_unsafe_char` (serde solo escapa C0) sale como `\uXXXX`, con pares
+/// sustitutos por encima de U+FFFF. Es JSON válido y sin pérdida, y nada
+/// del archivo llega crudo a una terminal, tampoco a través de `grep`, `jq`
+/// o `cat` del export. Seguro porque fuera de las cadenas serde solo emite
+/// ASCII estructural.
+fn json_line(row: reliagent::kernel::store::RawRow) -> String {
+    use std::fmt::Write;
+    let raw = serde_json::Value::Object(row).to_string();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if is_unsafe_char(c) {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Verifica sin escribir y lo resume en stderr: 0 íntegro; 3 si falla o no
+/// se puede comprobar (p. ej. sin clave en el llavero); 6 si está en uso.
+fn report_log_integrity(reader: &LogReader, db_path: &Path, anchor_dir: &Path) -> i32 {
+    let checked = keyring::load_audit_key().and_then(|key| {
+        let key = key.ok_or_else(|| {
+            KernelError::Keyring("no HMAC key in the OS keyring for this account".into())
+        })?;
+        let head = keyring::KeyringHead::for_log(db_path)?;
+        reader.verify(anchor_dir, key, Some(&head))
+    });
+    match checked {
+        Ok(n) => {
+            eprintln!("[reli] log íntegro: {n} entradas (solo lectura, no se modificó nada)");
+            EXIT_OK
+        }
+        Err(e) => {
+            eprintln!("[reli] log NO verificado: {}", error_text(&e));
+            eprintln!(
+                "[reli] las entradas se muestran tal como están en el archivo: no son \
+                 fiables a partir del punto indicado"
+            );
+            store_error_exit(&e)
+        }
+    }
+}
+
 /// Avisa de acciones `pending` sin resultado (p. ej. tras un crash).
 fn print_open_actions(store: &AuditStore) {
     let open = store.unresolved_pending();
@@ -1761,6 +1937,52 @@ mod tests {
 
     fn raw(json: &str) -> Box<serde_json::value::RawValue> {
         serde_json::value::RawValue::from_string(json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn log_lines_are_lossless_json_with_no_raw_unsafe_characters() {
+        // Lo que un atacante podría dejar en audit.db: escapes de terminal,
+        // DEL, CSI de C1, bidi, separador de línea y una etiqueta invisible.
+        let hostile = "a\u{1b}[2J\u{7f}\u{9b}31m\u{202e}\u{2028}x\u{e0041}é日";
+        let mut row = reliagent::kernel::store::RawRow::new();
+        row.insert("tool".into(), hostile.into());
+        row.insert("sequence_no".into(), 7.into());
+        let line = json_line(row);
+        assert!(!line.chars().any(is_unsafe_char), "{line}");
+        assert!(line.contains(r"\udb40\udc41"), "surrogate pair: {line}");
+        assert!(line.contains("é日"), "visible text stays as it is: {line}");
+        let back: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(back["tool"], hostile);
+        assert_eq!(back["sequence_no"], 7);
+    }
+
+    #[test]
+    fn different_spellings_of_a_proposal_are_audited_with_the_same_bytes() {
+        // La propiedad por la que se eligió JCS (Ronda 2): el args_hash no
+        // depende de cómo escriba el JSON el modelo. Se cumple porque la
+        // propuesta se convierte en un tipo y los args firmados se generan
+        // desde él (HASH_FORMAT.md §3), no desde el texto recibido.
+        let spellings = [
+            r#"{"tool":"write_file","args":{"path":"notes/a.txt","content":"hola"}}"#,
+            r#"{ "args" : { "content" : "hola", "path" : "notes/a.txt" }, "tool" : "write_file" }"#,
+            r#"{"tool":"write\u005ffile","args":{"path":"notes\/a\u002etxt","content":"\u0068ola"}}"#,
+            r#"{"extra":[1,2,3],"tool":"write_file","args":{"path":"notes/a.txt","content":"hola","x":null}}"#,
+        ];
+        let audited: Vec<String> = spellings
+            .iter()
+            .map(|s| {
+                let action = parse_proposal(&raw(s)).unwrap();
+                format!(
+                    "{}|{}",
+                    action.tool(),
+                    serde_json::to_string(&action.audit_args()).unwrap()
+                )
+            })
+            .collect();
+        for other in &audited[1..] {
+            assert_eq!(other, &audited[0]);
+        }
+        assert_eq!(audited[0], r#"write_file|{"path":"notes/a.txt","bytes":4}"#);
     }
 
     #[test]

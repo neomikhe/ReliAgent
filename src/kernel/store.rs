@@ -1,4 +1,6 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::config::DbConfig;
+use rusqlite::limits::Limit;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -86,14 +88,14 @@ impl AuditStore {
 
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
+                super::create_private_dir_all(parent)?;
             }
         }
 
         let conn = Connection::open(db_path)
             .map_err(|e| KernelError::Audit(format!("open sqlite: {e}")))?;
         configure_connection(&conn)?;
-        reject_foreign_schema_objects(&conn)?;
+        check_schema(&conn)?;
         apply_migrations(&conn, db_path)?;
 
         let persisted = load_all_entries(&conn)?;
@@ -237,53 +239,7 @@ impl AuditStore {
     }
 
     pub fn verify(&self) -> KernelResult<()> {
-        self.log.verify()?;
-        self.check_head()?;
-        if let Some(latest) = self.anchor.latest()? {
-            match self.log.entry_hmac_at(latest.sequence_no) {
-                Some(hmac) => {
-                    if hmac != latest.hmac {
-                        return Err(KernelError::AuditCorrupted {
-                            sequence_no: latest.sequence_no,
-                            reason: "anchor hmac does not match DB hmac".into(),
-                        });
-                    }
-                }
-                None => {
-                    return Err(KernelError::AuditCorrupted {
-                        sequence_no: latest.sequence_no,
-                        reason: "anchor references a sequence_no missing from DB (truncation?)"
-                            .into(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// El log no puede ser más corto que su testigo, y la fila del testigo
-    /// tiene que ser la misma. Más filas que el testigo sí (crash entre el
-    /// commit y la escritura del testigo).
-    fn check_head(&self) -> KernelResult<()> {
-        let Some(witness) = self.head.as_ref() else {
-            return Ok(());
-        };
-        let Some(head) = witness.load()? else {
-            return Ok(());
-        };
-        match self.log.entry_hmac_at(head.sequence_no) {
-            Some(hmac) if hmac == head.hmac => Ok(()),
-            Some(_) => Err(KernelError::AuditCorrupted {
-                sequence_no: head.sequence_no,
-                reason: "row does not match the head witness kept in the OS keyring".into(),
-            }),
-            None => Err(KernelError::AuditCorrupted {
-                sequence_no: head.sequence_no,
-                reason: "log is shorter than the head witness kept in the OS keyring \
-                         (tail truncated, or audit.db deleted or replaced)"
-                    .into(),
-            }),
-        }
+        verify_parts(&self.log, Some(&self.anchor), self.head.as_deref())
     }
 
     pub fn len(&self) -> usize {
@@ -314,16 +270,8 @@ const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Pragmas de la conexión. Orden importante: el modo de bloqueo exclusivo se
 /// fija primero y el lock se toma de inmediato, antes de leer o migrar.
 fn configure_connection(conn: &Connection) -> KernelResult<()> {
-    let in_use = |what: &str, e: rusqlite::Error| {
-        if matches!(
-            e.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
-        ) {
-            KernelError::AuditBusy
-        } else {
-            KernelError::Audit(format!("{what}: {e}"))
-        }
-    };
+    harden_connection(conn)?;
+    let in_use = busy_or;
     // SQLite devuelve el modo efectivo sin error si no puede cambiarlo: se
     // comprueba en vez de asumir.
     let set_mode = |pragma: &str, value: &str, expected: &str| -> KernelResult<()> {
@@ -382,27 +330,420 @@ impl LogLock {
     }
 }
 
-/// `reli` solo crea tablas e índices. Un trigger (p. ej. `RAISE(IGNORE)`,
-/// que convierte un INSERT en un no-op silencioso) o una vista solo pueden
-/// venir de una manipulación del archivo.
-fn reject_foreign_schema_objects(conn: &Connection) -> KernelResult<()> {
-    let found: Option<(String, String)> = conn
-        .query_row(
-            "SELECT type, name FROM sqlite_master WHERE type IN ('trigger', 'view') LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| KernelError::Audit(format!("inspect schema: {e}")))?;
-    match found {
-        None => Ok(()),
-        Some((kind, name)) => Err(KernelError::AuditCorrupted {
-            sequence_no: 0,
-            reason: format!(
-                "schema check: audit.db contains a {kind} named {name:?} that reli never creates"
-            ),
+/// Verificación completa: cadena HMAC, testigo de cabeza y último anchor.
+/// La comparten `AuditStore::verify` y `LogReader::verify`.
+fn verify_parts(
+    log: &AuditLog,
+    anchor: Option<&AnchorLog>,
+    head: Option<&dyn HeadWitness>,
+) -> KernelResult<()> {
+    log.verify()?;
+    if let Some(witness) = head {
+        check_head(log, witness)?;
+    }
+    if let Some(anchor) = anchor {
+        check_anchor(log, anchor)?;
+    }
+    Ok(())
+}
+
+/// El log no puede ser más corto que su testigo, y la fila del testigo
+/// tiene que ser la misma. Más filas que el testigo sí (crash entre el
+/// commit y la escritura del testigo).
+fn check_head(log: &AuditLog, witness: &dyn HeadWitness) -> KernelResult<()> {
+    let Some(head) = witness.load()? else {
+        return Ok(());
+    };
+    match log.entry_hmac_at(head.sequence_no) {
+        Some(hmac) if hmac == head.hmac => Ok(()),
+        Some(_) => Err(KernelError::AuditCorrupted {
+            sequence_no: head.sequence_no,
+            reason: "row does not match the head witness kept in the OS keyring".into(),
+        }),
+        None => Err(KernelError::AuditCorrupted {
+            sequence_no: head.sequence_no,
+            reason: "log is shorter than the head witness kept in the OS keyring \
+                     (tail truncated, or audit.db deleted or replaced)"
+                .into(),
         }),
     }
+}
+
+/// La última línea del anchor tiene que existir en la BD con la misma HMAC.
+fn check_anchor(log: &AuditLog, anchor: &AnchorLog) -> KernelResult<()> {
+    let Some(latest) = anchor.latest()? else {
+        return Ok(());
+    };
+    match log.entry_hmac_at(latest.sequence_no) {
+        Some(hmac) if hmac == latest.hmac => Ok(()),
+        Some(_) => Err(KernelError::AuditCorrupted {
+            sequence_no: latest.sequence_no,
+            reason: "anchor hmac does not match DB hmac".into(),
+        }),
+        None => Err(KernelError::AuditCorrupted {
+            sequence_no: latest.sequence_no,
+            reason: "anchor references a sequence_no missing from DB (truncation?)".into(),
+        }),
+    }
+}
+
+/// Lectura del log sin modificar nada: el modo solo lectura que queda cuando
+/// la verificación falla (`reli log`). Conexión de solo lectura y sin
+/// checkpoint al cerrar: no crea el archivo, no migra, no cierra huérfanas,
+/// no escribe anchors ni testigo, no aplica journals ni vacía el -wal.
+/// Exportar y verificar leen la misma instantánea. Respeta el bloqueo de un
+/// `reli` en marcha (`AuditBusy`).
+pub struct LogReader {
+    conn: Connection,
+}
+
+/// Una fila de `audit_entries` con las columnas firmadas (las de v2).
+pub type RawRow = serde_json::Map<String, serde_json::Value>;
+
+impl LogReader {
+    pub fn open(db_path: &Path) -> KernelResult<Self> {
+        refuse_pending_recovery(db_path)?;
+        // Sin CREATE: un log que no existe no se crea.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(db_path, flags)
+            .map_err(|e| KernelError::Audit(format!("open sqlite: {e}")))?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(|e| KernelError::Audit(format!("disable checkpoint on close: {e}")))?;
+        harden_connection(&conn)?;
+        conn.busy_timeout(LOCK_WAIT)
+            .map_err(|e| KernelError::Audit(format!("set busy_timeout: {e}")))?;
+        conn.pragma_update(None, "query_only", "ON")
+            .map_err(|e| busy_or("set query_only", e))?;
+        // Una sola instantánea para exportar y verificar (se cierra al soltar).
+        conn.execute_batch("BEGIN DEFERRED")
+            .map_err(|e| busy_or("begin read", e))?;
+        Ok(Self { conn })
+    }
+
+    /// Versión del esquema, tras la allow-list (`check_schema`). Nada se
+    /// consulta en `audit_entries` antes de esto: con un esquema ajeno (una
+    /// vista, un trigger, columnas sin firmar) no se exporta nada.
+    fn checked_schema_version(&self) -> KernelResult<u32> {
+        let by_columns = check_schema(&self.conn)?;
+        match (read_schema_version(&self.conn)?.as_deref(), by_columns) {
+            (Some("1"), Some(1)) => Ok(1),
+            (Some("2"), Some(2)) => Ok(2),
+            (meta, columns) => Err(foreign_schema(format!(
+                "schema_version {:?} with {} audit_entries columns",
+                meta.map(|v| v.chars().take(32).collect::<String>()),
+                columns.map_or("no".into(), |v| format!("v{v}"))
+            ))),
+        }
+    }
+
+    /// Llama a `f` con cada fila, en orden de `sequence_no`, sin
+    /// interpretarla: una fila manipulada también se exporta tal cual. Solo
+    /// las columnas firmadas, con nombres fijos (`resolves_seq` es null en un
+    /// log v1). Si `f` devuelve un error, la lectura se detiene y lo devuelve.
+    pub fn for_each_row(&self, mut f: impl FnMut(RawRow) -> KernelResult<()>) -> KernelResult<()> {
+        // Constantes, no datos del archivo: sin riesgo de inyección.
+        let resolves = match self.checked_schema_version()? {
+            1 => "NULL",
+            _ => "resolves_seq",
+        };
+        let sql = format!(
+            "SELECT sequence_no, timestamp, tool, args_hash, status_kind, status_reason,
+                    {resolves}, prev_hmac, hmac, hash_format_version
+             FROM audit_entries ORDER BY sequence_no"
+        );
+        let read = |e| busy_or("read audit_entries", e);
+        let mut stmt = self.conn.prepare(&sql).map_err(read)?;
+        let mut rows = stmt.query([]).map_err(read)?;
+        while let Some(row) = rows.next().map_err(read)? {
+            let mut raw = RawRow::new();
+            for (i, name) in V2_COLUMNS.iter().enumerate() {
+                raw.insert(
+                    (*name).to_string(),
+                    sql_to_json(row.get_ref(i).map_err(read)?),
+                );
+            }
+            f(raw)?;
+        }
+        Ok(())
+    }
+
+    /// Verifica como `reli verify` (cadena HMAC, testigo de cabeza, anchors)
+    /// sin escribir nada. Devuelve el número de filas.
+    pub fn verify(
+        &self,
+        anchor_dir: &Path,
+        key: Vec<u8>,
+        head: Option<&dyn HeadWitness>,
+    ) -> KernelResult<usize> {
+        if self.checked_schema_version()? == 1 {
+            // Migrar escribe (y es sin vuelta atrás): no se hace aquí.
+            return Err(KernelError::Audit(
+                "audit.db still uses schema version 1 and is only verified after migrating: \
+                 copy the directory first; any other reli command (e.g. `reli verify`) \
+                 migrates it one-way and keeps audit.db.schema1.bak"
+                    .into(),
+            ));
+        }
+        let log = AuditLog::from_persisted(load_all_entries(&self.conn)?, key)?;
+        let anchor = existing_anchor_log(anchor_dir)?;
+        verify_parts(&log, anchor.as_ref(), head)?;
+        Ok(log.len())
+    }
+
+    #[cfg(test)]
+    fn rows(&self) -> KernelResult<Vec<RawRow>> {
+        let mut out = Vec::new();
+        self.for_each_row(|r| {
+            out.push(r);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    #[cfg(test)]
+    fn connection_is_query_only(&self) -> bool {
+        self.conn
+            .query_row("PRAGMA query_only", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 1
+    }
+}
+
+/// Valor SQLite → JSON sin perder información: lo que reli nunca escribe
+/// (BLOB, texto que no es UTF-8, reales no finitos) sale etiquetado en vez
+/// de parecerse a un valor normal.
+fn sql_to_json(value: rusqlite::types::ValueRef<'_>) -> serde_json::Value {
+    use rusqlite::types::ValueRef;
+    use serde_json::{Value, json};
+    match value {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => i.into(),
+        ValueRef::Real(f) => serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or_else(|| json!({ "real": f.to_string() })),
+        ValueRef::Text(t) => match std::str::from_utf8(t) {
+            Ok(s) => s.into(),
+            Err(_) => json!({ "text_hex": hex::encode(t) }),
+        },
+        ValueRef::Blob(b) => json!({ "blob_hex": hex::encode(b) }),
+    }
+}
+
+/// SQLite reescribe el archivo al abrirlo, incluso en solo lectura, si hay
+/// un journal pendiente (lo aplica sobre audit.db) o un -wal junto a una BD
+/// vacía (lo borra). `reli` nunca deja ninguno de los dos: se pide analizar
+/// una copia en vez de tocar el original.
+fn refuse_pending_recovery(db_path: &Path) -> KernelResult<()> {
+    let sibling = |suffix: &str| {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push(suffix);
+        PathBuf::from(name)
+    };
+    let present = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+    let reason = if present(&sibling("-journal")) {
+        "a rollback journal (audit.db-journal) is pending"
+    } else if std::fs::metadata(db_path)?.len() < 512 && present(&sibling("-wal")) {
+        "audit.db is empty but audit.db-wal exists"
+    } else {
+        return Ok(());
+    };
+    Err(KernelError::Audit(format!(
+        "{reason}: SQLite would rewrite these files even to read them; copy the whole \
+         directory and analyse the copy (e.g. with sqlite3)"
+    )))
+}
+
+/// Anchors de un log que se inspecciona. Sin directorio no hay nada que
+/// contrastar (al abrir, `AuditStore` lo crearía vacío); una ruta que existe
+/// pero no es un directorio solo puede ser una manipulación.
+fn existing_anchor_log(dir: &Path) -> KernelResult<Option<AnchorLog>> {
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KernelError::Io(e)),
+        Ok(m) if m.is_dir() => AnchorLog::open(dir, DEFAULT_ANCHOR_ROTATE_LINES).map(Some),
+        Ok(_) => Err(KernelError::AuditCorrupted {
+            sequence_no: 0,
+            reason: "the anchors path exists but is not a directory".into(),
+        }),
+    }
+}
+
+/// Error de SQLite; "base de datos ocupada/bloqueada" es `AuditBusy`.
+fn busy_or(what: &str, e: rusqlite::Error) -> KernelError {
+    if matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    ) {
+        KernelError::AuditBusy
+    } else {
+        KernelError::Audit(format!("{what}: {e}"))
+    }
+}
+
+/// `schema_version` de `schema_meta`, si la tabla y la clave existen.
+fn read_schema_version(conn: &Connection) -> KernelResult<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| busy_or("read schema_version", e))
+}
+
+/// Tablas que crea `reli`.
+const KNOWN_TABLES: [&[u8]; 2] = [b"audit_entries", b"schema_meta"];
+/// Columnas de `audit_entries`, en el orden en que las crean v1.sql y v2.sql.
+const V1_COLUMNS: [&str; 9] = [
+    "sequence_no",
+    "timestamp",
+    "tool",
+    "args_hash",
+    "status_kind",
+    "status_reason",
+    "prev_hmac",
+    "hmac",
+    "hash_format_version",
+];
+const V2_COLUMNS: [&str; 10] = [
+    "sequence_no",
+    "timestamp",
+    "tool",
+    "args_hash",
+    "status_kind",
+    "status_reason",
+    "resolves_seq",
+    "prev_hmac",
+    "hmac",
+    "hash_format_version",
+];
+/// Ningún valor del log puede pasar de esto (los de reli no llegan a 1 KiB).
+const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+
+/// Allow-list del esquema: solo las tablas e índices que crea `reli`, y en
+/// `audit_entries` exactamente las columnas de v1 o v2. Cualquier otra cosa
+/// (un trigger con `RAISE(IGNORE)`, una vista, una tabla virtual, una columna
+/// sin firmar) solo puede venir de una manipulación. La comparación es
+/// binaria a propósito: SQLite decide qué es un objeto por su `sql` y
+/// compara `type` sin distinguir mayúsculas y hasta el primer NUL, así que
+/// prohibir 'trigger' y 'view' se esquivaba. Devuelve la versión que indican
+/// las columnas (None si la tabla aún no existe).
+fn check_schema(conn: &Connection) -> KernelResult<Option<u32>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT CAST(type AS BLOB), CAST(name AS BLOB), CAST(tbl_name AS BLOB),
+                    CAST(sql AS BLOB)
+             FROM sqlite_master",
+        )
+        .map_err(|e| busy_or("inspect schema", e))?;
+    let objects: Vec<SchemaObject> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| busy_or("inspect schema", e))?;
+    for (kind, name, table, sql) in &objects {
+        if !schema_object_allowed(kind, name, table, sql) {
+            return Err(foreign_schema(format!(
+                "a {} named {}",
+                shown_bytes(kind),
+                shown_bytes(name)
+            )));
+        }
+    }
+    entry_columns_version(conn)
+}
+
+/// (type, name, tbl_name, sql) de `sqlite_master`, como bytes: los escribe
+/// quien escriba el archivo y pueden no ser UTF-8.
+type SchemaObject = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn schema_object_allowed(
+    kind: &Option<Vec<u8>>,
+    name: &Option<Vec<u8>>,
+    table: &Option<Vec<u8>>,
+    sql: &Option<Vec<u8>>,
+) -> bool {
+    let known = |n: &Option<Vec<u8>>| n.as_deref().is_some_and(|n| KNOWN_TABLES.contains(&n));
+    let sql_starts = |prefix: &[u8]| sql.as_deref().is_some_and(|s| s.starts_with(prefix));
+    match kind.as_deref() {
+        Some(b"table") => known(name) && name == table && sql_starts(b"CREATE TABLE "),
+        // Sin `sql`: índices automáticos (UNIQUE, PRIMARY KEY).
+        Some(b"index") => {
+            known(table)
+                && (sql.is_none()
+                    || sql_starts(b"CREATE INDEX ")
+                    || sql_starts(b"CREATE UNIQUE INDEX "))
+        }
+        _ => false,
+    }
+}
+
+/// Las columnas de `audit_entries` son exactamente las de v1 o las de v2, sin
+/// ocultas ni generadas: una columna más no está firmada y se leería como
+/// parte del log (por ejemplo, una ruta en claro).
+fn entry_columns_version(conn: &Connection) -> KernelResult<Option<u32>> {
+    let mut stmt = conn
+        .prepare("SELECT CAST(name AS BLOB), hidden FROM pragma_table_xinfo('audit_entries')")
+        .map_err(|e| busy_or("inspect columns", e))?;
+    let columns: Vec<(Option<Vec<u8>>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .and_then(|rows| rows.collect())
+        .map_err(|e| busy_or("inspect columns", e))?;
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let matches = |expected: &[&str]| {
+        columns.len() == expected.len()
+            && columns.iter().zip(expected).all(|((name, hidden), want)| {
+                *hidden == 0 && name.as_deref() == Some(want.as_bytes())
+            })
+    };
+    match (matches(&V1_COLUMNS), matches(&V2_COLUMNS)) {
+        (true, _) => Ok(Some(1)),
+        (_, true) => Ok(Some(2)),
+        _ => Err(foreign_schema("columns in audit_entries".into())),
+    }
+}
+
+fn foreign_schema(what: String) -> KernelError {
+    KernelError::AuditCorrupted {
+        sequence_no: 0,
+        reason: format!("schema check: audit.db contains {what} that reli never creates"),
+    }
+}
+
+/// Bytes del archivo para un mensaje: recortados y con escapes.
+fn shown_bytes(bytes: &Option<Vec<u8>>) -> String {
+    match bytes {
+        None => "NULL".into(),
+        Some(b) => format!(
+            "{:?}",
+            String::from_utf8_lossy(b)
+                .chars()
+                .take(40)
+                .collect::<String>()
+        ),
+    }
+}
+
+/// Defensas de SQLite para un archivo que puede estar manipulado: el
+/// esquema no puede llamar a funciones con efectos (`trusted_schema`), no se
+/// puede corromper el archivo desde SQL (DEFENSIVE), se comprueban las
+/// celdas al leer y ningún valor pasa de `MAX_VALUE_BYTES`.
+fn harden_connection(conn: &Connection) -> KernelResult<()> {
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|e| busy_or("set defensive", e))?;
+    conn.pragma_update(None, "trusted_schema", "OFF")
+        .map_err(|e| busy_or("set trusted_schema", e))?;
+    conn.pragma_update(None, "cell_size_check", "ON")
+        .map_err(|e| busy_or("set cell_size_check", e))?;
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES);
+    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 64);
+    Ok(())
 }
 
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> KernelResult<bool> {
@@ -434,14 +775,7 @@ fn apply_migrations(conn: &Connection, db_path: &Path) -> KernelResult<()> {
     conn.execute_batch(SCHEMA_META_BOOTSTRAP)
         .map_err(|e| KernelError::Audit(format!("bootstrap schema_meta: {e}")))?;
 
-    let version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|e| KernelError::Audit(format!("read schema_version: {e}")))?;
+    let version = read_schema_version(conn)?;
 
     let migrate = |sql: &str, name: &str| {
         conn.execute_batch(sql)
@@ -624,6 +958,28 @@ mod tests {
         let anchor = tmp.path().join("anchors");
         let store = AuditStore::open(&db, &anchor, TEST_KEY.to_vec()).unwrap();
         (tmp, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directories_it_creates_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let audit_dir = tmp.path().join("new").join("reliagent");
+        let _store = AuditStore::open(
+            &audit_dir.join("audit.db"),
+            &audit_dir.join("anchors"),
+            TEST_KEY.to_vec(),
+        )
+        .unwrap();
+        for dir in [
+            tmp.path().join("new"),
+            audit_dir.clone(),
+            audit_dir.join("anchors"),
+        ] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
     }
 
     /// Acción completa (pending + resolución). Devuelve la fila de resolución.
@@ -1136,6 +1492,103 @@ mod tests {
         assert!(matches!(res, Err(KernelError::AuditCorrupted { .. })));
     }
 
+    /// Ejecuta SQL arbitrario sobre el archivo, como un atacante con acceso
+    /// al disco (incluido `writable_schema`, que reli nunca activa).
+    fn tamper(db: &Path, sql: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(sql).unwrap();
+    }
+
+    /// AuditStore (y LogReader) rechazan el archivo como manipulado.
+    fn assert_refused_as_tampering(db: &Path, anchor: &Path) {
+        let res = AuditStore::open(db, anchor, TEST_KEY.to_vec());
+        assert!(
+            matches!(res, Err(KernelError::AuditCorrupted { .. })),
+            "AuditStore: {:?}",
+            res.err()
+        );
+        let reader = LogReader::open(db).unwrap();
+        let export = reader.rows();
+        assert!(
+            matches!(export, Err(KernelError::AuditCorrupted { .. })),
+            "export must not run on a foreign schema: {:?}",
+            export.map(|r| r.len())
+        );
+        assert!(matches!(
+            reader.verify(anchor, TEST_KEY.to_vec(), None),
+            Err(KernelError::AuditCorrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn trigger_or_view_disguised_by_the_type_column_is_refused() {
+        // SQLite decide si un objeto es trigger o vista por su `sql`; `type`
+        // se compara sin distinguir mayúsculas y hasta el primer NUL.
+        for disguise in ["'TRIGGER'", "'Trigger'", "'trigger' || char(0)"] {
+            let (_tmp, db, anchor, _head) = log_with_two_actions();
+            tamper(&db, SWALLOW_INSERTS);
+            tamper(
+                &db,
+                &format!(
+                    "PRAGMA writable_schema = ON;
+                     UPDATE sqlite_master SET type = {disguise} WHERE name = 'swallow';"
+                ),
+            );
+            assert_refused_as_tampering(&db, &anchor);
+        }
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        tamper(
+            &db,
+            "CREATE VIEW v AS SELECT * FROM audit_entries;
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_master SET type = 'VIEW' WHERE name = 'v';",
+        );
+        assert_refused_as_tampering(&db, &anchor);
+    }
+
+    #[test]
+    fn oversized_value_is_refused_instead_of_loaded() {
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        tamper(
+            &db,
+            "UPDATE audit_entries SET tool = printf('%.*c', 2000000, 'x') WHERE sequence_no = 0;",
+        );
+        assert!(AuditStore::open(&db, &anchor, TEST_KEY.to_vec()).is_err());
+        assert!(LogReader::open(&db).unwrap().rows().is_err());
+    }
+
+    #[test]
+    fn unknown_table_is_refused() {
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        tamper(&db, "CREATE TABLE notes (x TEXT);");
+        assert_refused_as_tampering(&db, &anchor);
+    }
+
+    #[test]
+    fn unsigned_extra_column_is_refused() {
+        // Una columna que no está firmada parecería parte del log.
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        tamper(
+            &db,
+            "ALTER TABLE audit_entries ADD COLUMN path TEXT DEFAULT 'notes/todo.txt';",
+        );
+        assert_refused_as_tampering(&db, &anchor);
+    }
+
+    #[test]
+    fn column_name_that_is_not_utf8_is_refused_without_panicking() {
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        tamper(
+            &db,
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_master
+                SET sql = replace(sql, 'hash_format_version INTEGER NOT NULL',
+                    'hash_format_version INTEGER NOT NULL, \"' || CAST(X'FF' AS TEXT) || '\" TEXT')
+              WHERE name = 'audit_entries';",
+        );
+        assert_refused_as_tampering(&db, &anchor);
+    }
+
     #[test]
     fn pending_is_not_acted_on_if_its_anchor_cannot_be_written() {
         let (tmp, mut store) = fresh_store();
@@ -1512,5 +1965,237 @@ mod tests {
         }
         store.verify().unwrap();
         assert_eq!(store.len(), 500);
+    }
+
+    // --- Modo solo lectura (`reli log`) --------------------------------------
+
+    /// Log con dos acciones completas (4 filas) y su testigo de cabeza.
+    fn log_with_two_actions() -> (TempDir, PathBuf, PathBuf, MemoryHead) {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("audit.db");
+        let anchor = tmp.path().join("anchors");
+        let head = MemoryHead::default();
+        {
+            let mut store =
+                AuditStore::open_with_head(&db, &anchor, TEST_KEY.to_vec(), Box::new(head.clone()))
+                    .unwrap();
+            audited(&mut store, "a.txt", 1, AuditStatus::Ok);
+            audited(&mut store, "b.txt", 2, AuditStatus::Ok);
+        }
+        (tmp, db, anchor, head)
+    }
+
+    fn sha256_file(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
+    }
+
+    #[test]
+    fn log_reader_lists_rows_and_verifies_a_healthy_log() {
+        let (_tmp, db, anchor, head) = log_with_two_actions();
+        let reader = LogReader::open(&db).unwrap();
+        let rows = reader.rows().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["sequence_no"], serde_json::json!(0));
+        assert_eq!(rows[0]["status_kind"], serde_json::json!("pending"));
+        assert_eq!(rows[1]["resolves_seq"], serde_json::json!(0));
+        assert_eq!(
+            reader
+                .verify(&anchor, TEST_KEY.to_vec(), Some(&head))
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn log_reader_still_shows_a_tampered_log_and_names_the_bad_row() {
+        let (_tmp, db, anchor, head) = log_with_two_actions();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE audit_entries SET tool = 'evil' WHERE sequence_no = 2",
+                [],
+            )
+            .unwrap();
+        let reader = LogReader::open(&db).unwrap();
+        let rows = reader.rows().unwrap();
+        assert_eq!(rows.len(), 4, "every row is still exported");
+        assert_eq!(rows[2]["tool"], serde_json::json!("evil"));
+        match reader.verify(&anchor, TEST_KEY.to_vec(), Some(&head)) {
+            Err(KernelError::AuditCorrupted { sequence_no: 2, .. }) => {}
+            other => panic!("expected corruption at seq 2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn log_reader_detects_truncation_through_the_head_witness() {
+        let (_tmp, db, anchor, head) = log_with_two_actions();
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM audit_entries WHERE sequence_no = 3", [])
+            .unwrap();
+        let reader = LogReader::open(&db).unwrap();
+        assert_eq!(reader.rows().unwrap().len(), 3);
+        assert!(matches!(
+            reader.verify(&anchor, TEST_KEY.to_vec(), Some(&head)),
+            Err(KernelError::AuditCorrupted { .. })
+        ));
+    }
+
+    #[test]
+    fn log_reader_never_writes_not_even_a_migration() {
+        let (_tmp, db, anchor, head) = log_with_two_actions();
+        // Deja una huérfana: abrir con AuditStore + actuar la cerraría.
+        Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM audit_entries WHERE sequence_no = 3", [])
+            .unwrap();
+        let before = sha256_file(&db);
+        let anchors_before = std::fs::read_dir(&anchor).unwrap().count();
+        let reader = LogReader::open(&db).unwrap();
+        let _ = reader.rows().unwrap();
+        let _ = reader.verify(&anchor, TEST_KEY.to_vec(), Some(&head));
+        assert!(reader.connection_is_query_only());
+        drop(reader);
+        assert_eq!(sha256_file(&db), before);
+        assert_eq!(std::fs::read_dir(&anchor).unwrap().count(), anchors_before);
+        assert_eq!(
+            head.load().unwrap().unwrap().sequence_no,
+            3,
+            "witness untouched"
+        );
+    }
+
+    /// SHA-256 de cada archivo del directorio, por nombre.
+    fn hash_files(dir: &Path) -> std::collections::BTreeMap<String, String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.is_file())
+            .map(|p| {
+                (
+                    p.file_name().unwrap().to_string_lossy().into_owned(),
+                    sha256_file(&p),
+                )
+            })
+            .collect()
+    }
+
+    /// Estado tras un corte: la segunda acción solo está en el -wal (el
+    /// checkpoint ocurre al cerrar). Se copia con el log todavía abierto.
+    fn crashed_log_with_rows_only_in_the_wal() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let live = tmp.path().join("live");
+        let crashed = tmp.path().join("crashed");
+        std::fs::create_dir_all(&crashed).unwrap();
+        let open = || {
+            AuditStore::open(
+                &live.join("audit.db"),
+                &live.join("anchors"),
+                TEST_KEY.to_vec(),
+            )
+        };
+        audited(&mut open().unwrap(), "a.txt", 1, AuditStatus::Ok);
+        let mut store = open().unwrap();
+        audited(&mut store, "b.txt", 2, AuditStatus::Ok);
+        for name in ["audit.db", "audit.db-wal"] {
+            std::fs::copy(live.join(name), crashed.join(name)).unwrap();
+        }
+        drop(store);
+        (tmp, crashed)
+    }
+
+    #[test]
+    fn log_reader_reads_rows_left_in_the_wal_without_changing_any_file() {
+        let (_tmp, dir) = crashed_log_with_rows_only_in_the_wal();
+        let before = hash_files(&dir);
+        let reader = LogReader::open(&dir.join("audit.db")).unwrap();
+        assert_eq!(
+            reader.rows().unwrap().len(),
+            4,
+            "rows in the WAL are exported too"
+        );
+        drop(reader);
+        let after = hash_files(&dir);
+        for (name, hash) in &before {
+            assert_eq!(
+                after.get(name),
+                Some(hash),
+                "{name} was modified or deleted"
+            );
+        }
+        for name in after.keys().filter(|n| !before.contains_key(*n)) {
+            assert!(name.ends_with("-shm"), "unexpected new file {name}");
+        }
+    }
+
+    #[test]
+    fn log_reader_refuses_files_sqlite_would_rewrite_even_when_reading() {
+        // Journal pendiente: SQLite lo aplicaría sobre audit.db.
+        let (_tmp, db, _anchor, _head) = log_with_two_actions();
+        let journal = db.with_file_name("audit.db-journal");
+        std::fs::write(&journal, b"junk").unwrap();
+        let before = sha256_file(&db);
+        assert!(LogReader::open(&db).is_err());
+        assert_eq!(std::fs::read(&journal).unwrap(), b"junk");
+        assert_eq!(sha256_file(&db), before);
+        // BD vacía junto a un -wal: SQLite borraría el -wal.
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("audit.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::write(tmp.path().join("audit.db-wal"), b"wal").unwrap();
+        assert!(LogReader::open(&db).is_err());
+        assert_eq!(
+            std::fs::read(tmp.path().join("audit.db-wal")).unwrap(),
+            b"wal"
+        );
+    }
+
+    #[test]
+    fn log_reader_does_not_create_a_missing_log() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("missing").join("audit.db");
+        assert!(LogReader::open(&db).is_err());
+        assert!(!db.exists());
+        assert!(!db.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn log_reader_reports_busy_while_reli_holds_the_log() {
+        let (_tmp, db, anchor, _head) = log_with_two_actions();
+        let _store = AuditStore::open(&db, &anchor, TEST_KEY.to_vec()).unwrap();
+        let res = LogReader::open(&db).and_then(|r| r.rows());
+        assert!(
+            matches!(res, Err(KernelError::AuditBusy)),
+            "{:?}",
+            res.err()
+        );
+    }
+
+    #[test]
+    fn log_reader_refuses_to_verify_an_unmigrated_v1_log_without_migrating_it() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("audit.db");
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(SCHEMA_META_BOOTSTRAP).unwrap();
+            conn.execute_batch(SCHEMA_V1_SQL).unwrap();
+        }
+        let reader = LogReader::open(&db).unwrap();
+        assert_eq!(reader.rows().unwrap().len(), 0);
+        let err = reader
+            .verify(&tmp.path().join("anchors"), TEST_KEY.to_vec(), None)
+            .unwrap_err();
+        assert!(format!("{err}").contains("schema version"), "{err}");
+        drop(reader);
+        let version: String = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
     }
 }

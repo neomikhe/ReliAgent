@@ -36,7 +36,7 @@ is a bug. Open an issue against this file in the same PR.
 |---|---|---|
 | A | Files **outside** the sandbox root (`~/ReliAgent_Sandbox/`). | Writes forbidden by default; path validation + `cap-std` capability. Reads follow the same rule (v0.2 will add an opt-in read allowlist with per-file approval). |
 | B | Integrity of the action log. | Linear HMAC-SHA256 chain over every recorded entry; `anchor.log` as external witness against truncation. |
-| C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, libsecret on Linux). Never written to disk in plaintext, never logged. |
+| C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, the Secret Service over D-Bus on Linux). Never written to disk in plaintext, never logged. |
 | D | Approval gate. | TTY prompt before any mutating proposal executes. In non-interactive mode or without a TTY, the default is **reject**. |
 | E | Privacy of the user. | Zero outbound network traffic from `reli` itself. The Python sidecar talks to Ollama on `127.0.0.1:11434` only: the host is hard-coded, and `OLLAMA_HOST`, proxy environment variables and HTTP redirects are ignored. Model downloads happen only when the user runs `ollama pull`. |
 
@@ -58,6 +58,7 @@ deterministic Rust code — the LLM critic is a second layer only and
 | Windows extended-length prefix `\\?\` or device prefix `\\.\` | Rejected as `InvalidPath`. |
 | NTFS alternate data streams (`file.txt:hidden`) | Any `:` in the filename segment on Windows is rejected. |
 | Null byte injection (`foo.txt\0.jpg`) | Rejected as `InvalidPath`. |
+| Deceptive names: control characters (CR/LF, ESC, C1), bidi overrides and isolates (`invoice\u202Efdp.exe`), zero-width characters, BOM, Unicode line separators | Rejected as `InvalidPath` for every tool, before any other rule and before I/O, so such a name can never be shown to the approver, created in the sandbox or listed later. The same character set is escaped whenever the CLI prints text of external origin. |
 | Empty components collapsing to `..` (`foo//../bar`) | `Path::components` still emits `ParentDir`; rejected. |
 | Symlink-swap TOCTOU | `cap-std` opens every file through the sandbox capability; it does not follow symlinks that escape the root. |
 
@@ -78,8 +79,8 @@ deterministic Rust code — the LLM critic is a second layer only and
 | `prev_hmac` tampering (broken chain link) | `verify()` walks the chain; mismatch aborts open with `AuditCorrupted`. |
 | Intermediate row deletion | `sequence_no` contiguity check catches the gap. |
 | Tail truncation (delete the last rows) | In-DB chain alone cannot detect this. `anchor.log` (outside the DB, same disk, unkeyed) catches a truncation of the DB alone. A **head witness** in the OS keyring (last `sequence_no` + HMAC, one entry per log) catches a coordinated truncation of DB *and* anchor, and a deleted or replaced `audit.db`: a log shorter than its witness fails with `AuditCorrupted`. |
-| Planted trigger or view in `audit.db` (e.g. `RAISE(IGNORE)` turning every INSERT into a silent no-op) | `reli` refuses to open a database that contains any trigger or view, and every INSERT must report exactly one written row. |
-| Editing columns that look meaningful but are not signed | `status_reason` must be NULL for `pending`/`ok` and non-NULL for `error`/`rejected`; anything else is `AuditCorrupted`. |
+| Planted trigger, view, extra table or virtual table in `audit.db` (e.g. `RAISE(IGNORE)` turning every INSERT into a silent no-op), including disguised ones (`type = 'TRIGGER'` or `'trigger' || char(0)`, which SQLite still loads as a trigger) | Strict allow-list of the schema, compared byte for byte: only the tables `audit_entries` and `schema_meta` (plain `CREATE TABLE`) and indexes on them; anything else is `AuditCorrupted` before any query touches the data. Every connection also runs with `trusted_schema = OFF`, `SQLITE_DBCONFIG_DEFENSIVE`, `cell_size_check` and a 1 MiB limit per value. Every INSERT must report exactly one written row. |
+| Editing or adding columns that look meaningful but are not signed (e.g. a `path` column with a plausible value) | `audit_entries` must have exactly the v1 or v2 columns, none hidden or generated. `status_reason` must be NULL for `pending`/`ok` and non-NULL for `error`/`rejected`; anything else is `AuditCorrupted`. `reli log` only exports the signed columns, under fixed names. |
 | Forcing the destructive v1→v2 migration on a v2 log (setting `schema_version` back to `1`) | Refused when the table already has v2 columns; a real v1 log is backed up (`audit.db.schema1.bak`) before migrating. |
 | Replay: insert a duplicate `sequence_no` | SQLite `UNIQUE` / `PRIMARY KEY` constraint rejects it at INSERT time; even if injected via raw SQL, the chain re-verification fails. |
 | Clock rollback or past-timestamp forgery | Timestamp is inside the HMAC input; any change breaks the chain. Ordering is enforced by `sequence_no`, not the clock. |
@@ -87,6 +88,8 @@ deterministic Rust code — the LLM critic is a second layer only and
 | Side effect with no log entry (crash, power loss or log failure between acting and logging) | **Log before act:** a `pending` entry is committed with `synchronous = FULL` (plus `fullfsync` on macOS), and its anchor line and head witness are written, before approval and execution; if any of that fails, nothing runs. A `pending` left without outcome is closed as `error`/`abandoned` ("may or may not have run") by the next session, which names it on the terminal. |
 | Two `reli` processes racing on the log (or one closing the other's in-flight `pending` as abandoned) | The database is opened with an exclusive file lock; a second process (including `reli reset`) waits about 2 s and exits with code `6`. |
 | Forged or inconsistent outcome (resolving a non-pending row, resolving twice, outcome for different args) | Checked by `verify()` for every v2 row, plus a `UNIQUE` index on `resolves_seq`. Only possible at all with the HMAC key. |
+| Acting on, or destroying evidence in, a log that fails verification | **Read-only mode:** every command that would act refuses (exit `3`) and names the first bad entry. `reli log` exports the rows as stored and then reports where verification fails. It uses a read-only SQLite connection with no checkpoint on close and refuses to open files SQLite would rewrite even when reading (a pending journal, a WAL next to an empty database); it never migrates, closes orphans, writes anchors or witnesses, or creates a key. Its output escapes control and invisible characters as JSON. Nothing is repaired automatically and there is no `--force`. |
+| Another local account reading the log (paths and times of everything the agent did) | On Linux/macOS the audit directory and its `anchors/` are created `0700`, and `reli` warns when an existing audit directory is readable or writable by others. On Windows the default directory inherits the profile's private ACL; a custom `--audit-dir` does not (residual, see §4). |
 
 ### 3.4 Orchestration / approval attacks
 
@@ -141,9 +144,10 @@ They are documented here so no user is surprised.
   and the Rust policy engine, never a replacement.
 - **Side channels on the keyring.** Memory scraping, debugger attach,
   weaknesses in the OS keyring implementation itself.
-- **Linux without libsecret.** Fallback to a local encrypted file is a
-  strict downgrade versus a native keyring. Documented in
-  `KNOWN_ISSUES.md`.
+- **Linux without a Secret Service.** v0.1 has no fallback: `reli`
+  refuses to run rather than keep the HMAC key in a weaker place. Any
+  future file-based fallback would be an explicit, documented downgrade
+  (`KNOWN_ISSUES.md`).
 - **Sandbox contents are not covered by the log.** The log records which
   actions ran (tool, `args_hash`, outcome), not what the files contain.
   An antivirus — or anyone — that rewrites or quarantines a sandboxed file
@@ -169,6 +173,19 @@ They are documented here so no user is surprised.
 - **Network file systems.** SQLite's file locks are unreliable on SMB/NFS.
   Keep `~/.reliagent/` on a local disk; on a network share two `reli`
   processes could race despite the exclusive lock.
+- **`args_hash` is an unkeyed hash.** It is SHA-256 of
+  `{"path":…,"bytes":…}`, so anyone holding the log or a `reli log`
+  export can confirm a guessed path. The log keeps paths out of plain
+  text, not out of reach of guessing.
+- **Audit directory ACLs on Windows.** `reli` sets no ACL of its own: a
+  custom `--audit-dir` outside the user profile inherits its parent's
+  permissions, which may let other local users read or modify it.
+- **First-run key race.** Two `reli` processes that both find no HMAC
+  key at the same moment may each create one; one log then never
+  verifies (fail closed, but unusable).
+- **Names that look alike but are not control characters.** Unicode
+  normalization variants (NFC vs NFD) and, on Windows, names ending in a
+  dot or a space are accepted as given.
 - **SHA-256 collision resistance.** Treated as cryptographically sound in
   2026; a break in SHA-256 would invalidate the chain.
 

@@ -73,11 +73,11 @@ not that.
 
 | Area | Status |
 |---|---|
-| Rust kernel (policy engine, sandbox, HMAC chain) | Implemented, ~90 unit tests + property tests. |
-| CLI (`reli run / verify / sandbox / reset`) | Implemented. |
+| Rust kernel (policy engine, sandbox, HMAC chain) | Implemented, ~150 unit tests + property tests. |
+| CLI (`reli run / verify / log / sandbox / reset`) | Implemented. |
 | Python sidecar (orchestrator + critic + Ollama client) | Implemented. Stdlib-only, no runtime dependencies. Tested against a local fake Ollama server; verified manually against Ollama 0.31.2. |
 | Model pinning (`qwen2.5:7b-instruct-q4_K_M`) | Weights SHA-256 pinned and re-checked on every `reli run`. |
-| Red-team suite (25 vectors from threat model §16) | Implemented in [`tests/red_team.rs`](tests/red_team.rs). |
+| Red-team suite (26 vectors) | [`tests/red_team.rs`](tests/red_team.rs): 22 run (some only on the platform they target); 4 are pinned as ignored until the feature they test exists — session quota and `grant_scope` (v0.2), byte-exact JCS (next hash format). |
 | Self-contained release (binary + pinned python-build-standalone runtime + sidecar) | Implemented: `scripts/package_release.sh`, built and smoke-tested per platform by the release workflow. |
 | Tauri GUI | Not in v0.1. Planned for v0.2. |
 | `grant_scope` / read allowlist / session quotas | Planned for v0.2. |
@@ -210,9 +210,24 @@ To start over:
 and the head witness kept in the OS keyring. A successful verification
 prints the number of entries, the most recent HMAC and any action still
 waiting for its outcome. A failure prints the sequence number where tampering was detected,
-and from then on every `reli` command that opens the log refuses to run
-(exit code `3`) until you investigate or reset. The byte-level format is
-in [`docs/HASH_FORMAT.md`](docs/HASH_FORMAT.md).
+and from then on `reli` stays in **read-only mode** until you investigate
+or reset: every command that would act refuses to run (exit code `3`),
+and nothing is repaired for you.
+
+```bash
+./target/release/reli log > audit-export.jsonl
+```
+
+`log` prints every entry exactly as it is stored, one JSON object per
+line, and then reports on stderr whether the log verifies (exit `0`) or
+where it breaks (exit `3`). It works on a healthy log too, and it never
+modifies the log: it reads through a read-only SQLite connection, never
+migrates, and creates no key, anchor or witness. Control and invisible
+characters are written as JSON escapes, so the export is safe to `cat`
+or `grep` in a terminal. If the database holds anything `reli` never
+creates (a view, a trigger, an extra column) it refuses to export and
+asks you to analyse a copy. The byte-level format is in
+[`docs/HASH_FORMAT.md`](docs/HASH_FORMAT.md).
 
 Each action appears as two entries: `pending` (written before the policy
 check, approval and execution) and its outcome. If `reli` is killed
@@ -229,6 +244,7 @@ about 2 s and exits with code `6` (busy, not tampering).
 |---|---|---|
 | `reli run "<prompt>"` | Sends `<prompt>` to the Python sidecar, verifies Ollama and the pinned model, runs the agent/critic loop, gates every proposed tool call on the policy engine + TTY. `--dry-run` only shows the proposal; `--mock-llm` uses the deterministic test agent instead of Ollama. | `0` ok, `1` rejected, `2` bad input, `3` audit, `4` bridge / Ollama / model check, `5` timeout, `6` log in use |
 | `reli verify` | Re-runs the HMAC chain, anchor and head-witness checks over the whole audit DB. | `0` clean, `3` corrupted, `6` log in use |
+| `reli log` | Read-only: prints every audit entry as JSON Lines (invisible and control characters escaped), then the verification result. Also works on a log that fails verification. | `0` clean, `3` corrupted or not verifiable, `6` log in use |
 | `reli sandbox path` | Prints the sandbox root. | `0` |
 | `reli sandbox status` | Prints sandbox path, audit entry count, last HMAC, keyring label, open actions. | `0` / `6` |
 | `reli reset --wipe-everything` | Wipes sandbox, audit DB (and its migration backup), anchors, and the keyring entries. Asks for `WIPE` confirmation unless `--force`; refuses while another `reli` uses the log. | `0` / `1` / `6` |
@@ -266,7 +282,7 @@ reliagent/
 │       └── __main__.py     # stdin/stdout NDJSON server
 ├── tests/
 │   ├── bridge_jsonrpc.rs   # cross-process bridge integration
-│   └── red_team.rs         # 25 adversarial vectors from §16
+│   └── red_team.rs         # 26 adversarial vectors
 ├── docs/
 │   ├── THREAT_MODEL.md
 │   └── HASH_FORMAT.md

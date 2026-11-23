@@ -8,6 +8,26 @@ pub mod store;
 pub mod tools;
 
 use std::io;
+use std::path::Path;
+
+/// Crea `dir` y los padres que falten, en Unix solo accesibles para el
+/// usuario (0700): el log, los anchors y la copia de migración guardan las
+/// rutas y las horas de lo que hizo el agente. Los directorios que ya
+/// existían no se tocan. En Windows, los permisos heredados del perfil.
+pub fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {

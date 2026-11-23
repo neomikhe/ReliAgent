@@ -26,7 +26,7 @@ impl AnchorLog {
         if rotate_threshold == 0 {
             return Err(KernelError::Audit("rotate_threshold must be > 0".into()));
         }
-        std::fs::create_dir_all(dir)?;
+        super::create_private_dir_all(dir)?;
         let path = dir.join(ANCHOR_FILENAME);
         let lines = if path.exists() {
             count_lines(&path)?

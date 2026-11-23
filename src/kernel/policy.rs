@@ -4,6 +4,45 @@ use super::{KernelError, KernelResult};
 
 pub const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Caracteres que hacen que un texto se lea distinto de lo que es:
+/// controles C0 y C1 y DEL (`char::is_control`), los Default_Ignorable de
+/// Unicode (invisibles: anchura cero y unión U+200B–U+200F, marcas y
+/// controles bidi, U+2060–U+206F, guion suave, fillers de Hangul, selectores
+/// de variación, etiquetas U+E0000–U+E0FFF que el modelo lee y el humano no
+/// ve), separadores U+2028/U+2029, anotaciones U+FFF9–U+FFFB, BOM y el
+/// braille en blanco. Prohibidos en rutas del sandbox; la CLI los escapa al
+/// mostrar texto. Coste aceptado: nombres que necesitan ZWJ/ZWNJ o un
+/// selector de variación (algunos emoji, persa, escrituras índicas) se
+/// rechazan.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
+}
+
+/// Valida una ruta relativa al sandbox para cualquier herramienta
+/// (`write_file`, `read_file`, `list_dir`) y la devuelve normalizada.
 pub fn validate_write_path(raw: &str) -> KernelResult<PathBuf> {
     if raw.is_empty() {
         return Err(KernelError::InvalidPath {
@@ -14,6 +53,16 @@ pub fn validate_write_path(raw: &str) -> KernelResult<PathBuf> {
     if raw.contains('\0') {
         return Err(KernelError::InvalidPath {
             reason: "path contains a null byte".into(),
+        });
+    }
+    // Antes que cualquier otra regla: un nombre así engañaría al humano que
+    // aprueba y a cualquier herramienta que liste el sandbox después.
+    if let Some(c) = raw.chars().find(|&c| is_unsafe_char(c)) {
+        return Err(KernelError::InvalidPath {
+            reason: format!(
+                "path contains a control or invisible character (U+{:04X})",
+                c as u32
+            ),
         });
     }
 
@@ -124,6 +173,70 @@ mod tests {
         assert!(matches!(err, KernelError::InvalidPath { .. }));
     }
 
+    #[test]
+    fn rejects_control_and_invisible_chars_naming_the_code_point() {
+        let err = validate_write_path("a\u{202e}b.txt").unwrap_err();
+        assert!(format!("{err}").contains("U+202E"), "{err}");
+        let err = validate_write_path("a\nb.txt").unwrap_err();
+        assert!(format!("{err}").contains("U+000A"), "{err}");
+    }
+
+    #[test]
+    fn unsafe_char_set_matches_the_documented_ranges() {
+        for c in [
+            '\0', '\t', '\n', '\r', '\u{1b}', '\u{7f}', '\u{80}', '\u{9f}', '\u{61c}', '\u{200b}',
+            '\u{200f}', '\u{202a}', '\u{202e}', '\u{2028}', '\u{2029}', '\u{2066}', '\u{2069}',
+            '\u{feff}',
+        ] {
+            assert!(is_unsafe_char(c), "U+{:04X}", c as u32);
+        }
+        for c in ['a', ' ', 'é', '\u{a0}', '\u{2010}', '日', '🦤'] {
+            assert!(!is_unsafe_char(c), "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn default_ignorable_characters_are_unsafe() {
+        // Invisibles que el humano no ve en el prompt pero el modelo sí lee
+        // (p. ej. etiquetas U+E0000: "ASCII smuggling").
+        for c in [
+            '\u{ad}',
+            '\u{34f}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{17b5}',
+            '\u{180b}',
+            '\u{180e}',
+            '\u{180f}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{2065}',
+            '\u{206a}',
+            '\u{206f}',
+            '\u{2800}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{ffa0}',
+            '\u{fff0}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{1bca0}',
+            '\u{1bca3}',
+            '\u{1d173}',
+            '\u{1d17a}',
+            '\u{e0000}',
+            '\u{e0041}',
+            '\u{e007f}',
+            '\u{e0100}',
+            '\u{e01ef}',
+            '\u{e0fff}',
+        ] {
+            assert!(is_unsafe_char(c), "U+{:04X}", c as u32);
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn rejects_windows_drive_path() {
@@ -201,6 +314,23 @@ mod proptests {
             let res = validate_write_path(&raw);
             let is_invalid = matches!(res, Err(KernelError::InvalidPath { .. }));
             prop_assert!(is_invalid, "expected InvalidPath for raw containing NUL");
+        }
+
+        /// Propiedad: un carácter de control o invisible en cualquier posición
+        /// se rechaza siempre con InvalidPath, antes que cualquier otra regla.
+        #[test]
+        fn unsafe_chars_always_rejected(
+            prefix in "[a-zA-Z0-9_/.]{0,20}",
+            bad in prop::sample::select(vec![
+                '\u{1}', '\n', '\r', '\u{1b}', '\u{7f}', '\u{85}', '\u{9b}', '\u{61c}',
+                '\u{200b}', '\u{200e}', '\u{202e}', '\u{2028}', '\u{2067}', '\u{feff}',
+            ]),
+            suffix in "[a-zA-Z0-9_/.]{0,20}"
+        ) {
+            let raw = format!("{prefix}{bad}{suffix}");
+            let res = validate_write_path(&raw);
+            let is_invalid = matches!(res, Err(KernelError::InvalidPath { .. }));
+            prop_assert!(is_invalid, "expected InvalidPath for {:?}", raw);
         }
 
         /// Propiedad: cualquier path que empiece por "/" se rechaza como absoluto

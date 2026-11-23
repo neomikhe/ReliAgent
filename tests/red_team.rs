@@ -259,12 +259,13 @@ fn v10_oversized_write_rejected() {
 
 // ---------------------------------------------------------------------------
 // Vector 11 — Session quota (101 files in a session).
-// v0.1 has no session concept; this lands in v0.2 together with
-// `grant_scope`. The test is written now so it will start passing as soon
-// as the feature exists.
+// v0.1 runs at most one action per `reli` process (one `run`, `write`,
+// `read` or `ls`), so there is no multi-action session to cap. The quota
+// lands in v0.2 together with sessions and `grant_scope` (decided
+// 2026-11-23, see KNOWN_ISSUES "v0.1-specific limitations").
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "v0.2: SessionQuotaExceeded not yet implemented"]
+#[ignore = "v0.2: SessionQuotaExceeded needs multi-action sessions (v0.1: one action per process)"]
 fn v11_session_quota_exceeded() {
     eprintln!(
         "[red-team v11] SKIPPED: session/quota tracking planned for v0.2 — \
@@ -358,16 +359,22 @@ fn v14_timestamp_tampering_detected() {
 
 // ---------------------------------------------------------------------------
 // Vector 15 — JCS canonicalization (RFC 8785).
-// Spec requires that two JSON encodings of the same logical args produce
-// identical hashes. Current code uses serde_json default ordering, which
-// is field-order-dependent. Strict JCS lands in v0.2.
+// The property behind it — two JSON spellings of the same proposal (key
+// order, whitespace, escapes, unknown fields) produce the same args_hash —
+// already holds in v0.1: the proposal is parsed into a typed action and the
+// signed args are generated from that type (docs/HASH_FORMAT.md §3). It is
+// tested where that parsing lives, in the binary crate:
+// `cli::tests::different_spellings_of_a_proposal_are_audited_with_the_same_bytes`.
+// What is deferred is byte-exact RFC 8785 output (members sorted: today
+// write_file signs `path` before `bytes`), which would change the signed
+// bytes and so needs hash format v3 (decided 2026-11-23).
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "v0.2: JCS (RFC 8785) canonicalization not yet enforced"]
+#[ignore = "hash format v3: byte-exact RFC 8785 member order; spelling-independence is tested in cli::tests"]
 fn v15_jcs_canonicalization() {
     eprintln!(
-        "[red-team v15] SKIPPED: args_hash must be JCS-stable (RFC 8785) \
-         across key-order permutations — planned for v0.2."
+        "[red-team v15] SKIPPED: byte-exact RFC 8785 output planned with hash \
+         format v3; spelling-independence of args_hash is tested in cli::tests."
     );
 }
 
@@ -585,6 +592,67 @@ fn v25_read_aws_credentials_blocked() {
             Err(other) => panic!("{candidate:?}: unexpected error {other:?}"),
             Ok(_) => panic!("{candidate:?}: read succeeded — escape"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vector 26 — Control and invisible characters in a path.
+// A name with CR/LF, ESC, C1 controls, bidi overrides or zero-width
+// characters reads differently from what it is (in the approval prompt, in
+// `ls`, in any tool that later lists the sandbox). The kernel refuses it for
+// every tool, before touching the file system.
+// ---------------------------------------------------------------------------
+#[test]
+fn v26_control_and_invisible_chars_in_path_rejected() {
+    let (_tmp, sandbox) = new_sandbox();
+    for raw in [
+        "notes\r\nINJECTED.txt",
+        "tab\there.txt",
+        "esc\u{1b}[2J.txt",
+        "c1\u{9b}.txt",
+        "del\u{7f}.txt",
+        "invoice\u{202e}fdp.exe",
+        "isolate\u{2066}x\u{2069}.txt",
+        "zero\u{200b}width.txt",
+        "bom\u{feff}.txt",
+        "line\u{2028}sep.txt",
+        "sub/ok\u{200f}/a.txt",
+        "report\u{2060}.txt",
+        "a.txt\u{e0049}\u{e0047}\u{e004e}",
+        "soft\u{ad}hyphen.txt",
+        "filler\u{3164}.txt",
+        "heart\u{fe0f}.txt",
+    ] {
+        let err = assert_path_rejected(raw);
+        assert!(
+            matches!(err, KernelError::InvalidPath { .. }),
+            "{raw:?}: {err:?}"
+        );
+        assert!(
+            matches!(
+                write_file(&sandbox, raw, b"x"),
+                Err(KernelError::InvalidPath { .. })
+            ),
+            "{raw:?}: write_file"
+        );
+        assert!(
+            matches!(
+                read_file(&sandbox, raw),
+                Err(KernelError::InvalidPath { .. })
+            ),
+            "{raw:?}: read_file"
+        );
+        assert!(
+            matches!(
+                list_dir(&sandbox, raw),
+                Err(KernelError::InvalidPath { .. })
+            ),
+            "{raw:?}: list_dir"
+        );
+    }
+    // Unicode visible normal (acentos, CJK, emoji) sigue permitido.
+    for raw in ["café.txt", "日本語/メモ.txt", "ñandú 🦤.md"] {
+        assert!(validate_write_path(raw).is_ok(), "{raw:?}");
     }
 }
 
