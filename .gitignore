@@ -1,24 +1,80 @@
-# Build output
-/target/
-/dist/
-/out/
-# python-build-standalone download cache (scripts/fetch_pbs.sh)
-/vendor/
+# ReliAgent .gitignore — allow-list.
+#
+# At the root of the repository (and inside python-core/ and .github/)
+# EVERYTHING is ignored except the entries listed here. A new top-level
+# file or folder is therefore never uploaded by accident (`git add -A`
+# skips it); to publish one, add a `!/<name>` line here on purpose.
+# Inside the allowed folders, the rules further down still keep build
+# output, caches, logs, binaries and secrets out.
 
-# Python
+# --- Root: only what the project needs --------------------------------
+/*
+!/.gitattributes
+!/.gitignore
+!/.github/
+!/CHANGELOG.md
+!/CODE_OF_CONDUCT.md
+!/CONTRIBUTING.md
+!/Cargo.lock
+!/Cargo.toml
+!/KNOWN_ISSUES.md
+!/LICENSE
+!/MODEL_SHA256.txt
+!/README.md
+!/SECURITY.md
+!/audits/
+!/docs/
+!/python-core/
+!/rust-toolchain.toml
+!/scripts/
+!/src/
+!/tests/
+
+# --- python-core/: the sidecar's sources, tests and lock file only -----
+/python-core/*
+!/python-core/.python-version
+!/python-core/pyproject.toml
+!/python-core/uv.lock
+!/python-core/src/
+!/python-core/tests/
+
+# --- .github/: workflows and Dependabot only ---------------------------
+/.github/*
+!/.github/workflows/
+!/.github/dependabot.yml
+
+# --- Never, anywhere in the tree ---------------------------------------
+# Build output and caches
+target/
+dist/
+build/
+out/
 __pycache__/
 *.py[cod]
 .venv/
+venv/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .coverage
+htmlcov/
 *.egg-info/
-# The tracked pin is python-core/.python-version.
-/.python-version
+*.profraw
+*.rs.bk
 
-# Local state of reli itself: never commit an audit log, its keys, an
-# export (`reli log > x.jsonl` holds paths and times) or a sandbox
+# Binaries and archives (releases are built by CI, never committed)
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.zip
+*.tar.gz
+*.tgz
+*.whl
+
+# Local state of reli: an audit log, its anchors, an export
+# (`reli log > x.jsonl` holds paths and times) or a sandbox
 .reliagent/
 ReliAgent_Sandbox/
 anchors/
@@ -26,14 +82,24 @@ anchors/
 *.db-wal
 *.db-shm
 *.db-journal
+*.sqlite
+*.sqlite3
 *.jsonl
-*.bak
 
-# Logs (including Ollama audit logs, which contain local paths) and dumps
+# Logs, dumps, temporary and backup files
 *.log
 *.dmp
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+*.swp
+*~
 
-# Secrets
+# Secrets and credentials
 .env
 .env.*
 !.env.example
@@ -41,20 +107,24 @@ anchors/
 *.pem
 *.p12
 *.pfx
+*.crt
+credentials.json
+secrets.json
 
 # Model weights (Ollama keeps them outside the repository)
 *.gguf
 *.safetensors
+*.bin
 
-# Editors and operating systems
+# Editors, operating systems
 .vscode/
 .idea/
-*.swp
-*~
+*.code-workspace
 .DS_Store
 ._*
 Thumbs.db
 Desktop.ini
+desktop.ini
 
 # The maintainer's private notes and local AI-assistant / MCP settings
 # (an .mcp.json can hold tokens)
@@ -64,3 +134,5 @@ CLAUDE.md
 CLAUDE.local.md
 .mcp.json
 .playwright-mcp/
+
+.gitignore
