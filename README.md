@@ -6,112 +6,143 @@
 > policy engine in Rust, and approved by you. ReliAgent itself makes no
 > network connections; the model runs in a local Ollama.
 
+[![test](https://github.com/neomikhe/ReliAgent/actions/workflows/test.yml/badge.svg)](https://github.com/neomikhe/ReliAgent/actions/workflows/test.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![status](https://img.shields.io/badge/status-research%20preview-orange)
 ![platform](https://img.shields.io/badge/platform-linux%20%7C%20macos%20%7C%20windows-lightgrey)
 
+**Research Preview (v0.1.0).** The design is stable enough to try and to
+attack; it is not production software. Read
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) before relying on it.
+
+## Contents
+
+- [At a glance](#at-a-glance)
+- [How it works](#how-it-works)
+- [What it looks like](#what-it-looks-like)
+- [Quick start](#quick-start)
+- [Install](#install)
+- [Using `reli`](#using-reli)
+- [Command reference](#command-reference)
+- [Security model in brief](#security-model-in-brief)
+- [Status and roadmap](#status-and-roadmap)
+- [Project layout](#project-layout)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [Licence](#licence)
+
 ---
 
-## What this is
+## At a glance
 
-ReliAgent is a **CLI-first research preview** of a different way to run
-local AI agents. Instead of trusting the LLM with direct filesystem access
-(as many agent setups do, by handing the model a shell or file-system
-tool), ReliAgent puts a small Rust kernel between the model and the OS:
+- **The model only proposes.** A local LLM suggests one tool call
+  (`write_file`, `read_file`, `list_dir`); it never touches the file
+  system itself.
+- **Deterministic rules decide.** A Rust policy engine confines every
+  path to a sandbox (`cap-std` capabilities, no traversal, no absolute or
+  device paths, no control or invisible characters) and caps file size.
+  Two critics can veto a proposal; nothing can override the rules.
+- **You approve.** Agent proposals wait for your `y` on the terminal; a
+  timeout or a missing terminal means *reject*.
+- **Logged before it runs.** Every action is written to a SQLite audit
+  log as `pending` before the policy check, the prompt or any file access,
+  then resolved as `ok`, `rejected` or `error`. Entries are HMAC-SHA256
+  chained with a key in the OS keyring, and the last entry is also
+  witnessed in the keyring, so edits, deletions and truncation are
+  detected (`reli verify`).
+- **Read-only when tampered.** A log that fails verification stops every
+  action; `reli log` still exports it, without changing a byte.
+- **No network from ReliAgent.** The Rust binary makes no outbound calls;
+  the Python sidecar talks only to `127.0.0.1:11434` and verifies the
+  pinned model's SHA-256 before every run.
+- **Verifiable releases.** Self-contained archives (binary + pinned Python
+  runtime), signed with cosign, with build provenance and SBOMs.
 
-- The model *proposes* a tool call. A deterministic critic and the LLM
-  critic can reject it; neither can approve what the kernel refuses.
-- The kernel writes the proposal to an HMAC-chained audit log as
-  `pending` **before** checking or running it. If that write fails,
-  nothing runs.
-- A deterministic Rust policy engine validates it (path jail, size cap).
-  If the engine says no, the engine wins — the human is not even asked.
-- A TTY prompt asks the human. Timeout or no TTY → default reject.
-- On approval, the action runs inside a `cap-std` sandbox capability.
-- The outcome (`ok`, `rejected` with the reason, or `error`) is written
-  as a second entry linked to the `pending` one. Each entry carries an
-  HMAC-SHA256 under a key kept in the OS keyring; tampering is detectable
-  with `reli verify`.
+## How it works
 
 ```
 prompt → sidecar: model proposes → deterministic critic → LLM critic (can only reject)
        → kernel:  log `pending` → policy engine → your y/N → cap-std sandbox → log outcome
 ```
 
+1. `reli run "<prompt>"` starts the Python sidecar (stdlib only, JSON-RPC
+   over stdin/stdout, isolated mode `python -I`).
+2. The sidecar checks that Ollama is local, has the pinned model and that
+   the weights on disk match [`MODEL_SHA256.txt`](MODEL_SHA256.txt); then
+   the agent proposes a tool call and both critics review it.
+3. The Rust kernel logs the proposal as `pending` (committed with
+   `synchronous = FULL`). If that fails, nothing runs.
+4. The policy engine validates it; a violation is logged as `rejected`
+   and you are not even asked.
+5. You approve or reject on the terminal (60 s timeout).
+6. The action runs inside the sandbox and its outcome is logged as a
+   second entry linked to the `pending` one.
+
 You trust `reli`, its bundled `python/` folder, your OS account and its
 keyring. The log does **not** cover what files contain now (an antivirus
 or you can change them later), proposals the critics already rejected
 (they never reach the kernel), or anything after someone ran code as you.
 
-**What this is not.** It is not blockchain, not "provably secure", not a
-production-ready agent framework. It is a Research Preview focused on one
-question: *can we make local agents auditable and human-gated by default,
-with no cloud and no magic?*
+## What it looks like
 
-For the threat model and what is explicitly **out of scope**, read
-[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) before relying on anything
-here.
+A real session on Windows (paths shortened; in v0.1.0 the CLI speaks
+Spanish):
 
----
+```text
+$ reli write notas/hola.txt "Hola desde ReliAgent"
+[reli] ok: 20 bytes escritos en C:\demo\sandbox\notas/hola.txt
+[reli] audit hmac: 5ad140dc81a3388352e9569bbeb24f080a932bb301bec4308a3f15b09828abf3
 
-## Why
+$ reli write ../fuera.txt "x"
+[reli] rechazado: path is outside the sandbox: ../fuera.txt
 
-Many local-agent setups share a bad habit: when the LLM hallucinates
-`rm -rf /`, the shell runs it. When it's prompt-injected by a file it just
-read, nothing in the stack notices. ReliAgent's answer:
+$ reli --non-interactive run "write a short to-do list to notas/todo.txt"
+[reliagent-py] verifying SHA-256 of qwen2.5:7b-instruct-q4_K_M (4.7 GB)...
+[reli] propuesta: {"tool":"write_file","args":{"path":"notas/todo.txt","content":"Buy groceries\nPick up kids\nFinish report"}}
+[reli] trace: deterministic_critic.verdict=approve
+[reli] trace: llm_critic.verdict=approve
+[reli] non-interactive: propuesta NO aprobada automáticamente
 
-1. **Determinism has the last word.** The model and the critics can only
-   propose or veto; the hard rules in Rust (path jail, size cap) and your
-   y/N decide after every LLM step, and no LLM can override them.
-2. **Log before act, tamper-evidence by default.** Every action that
-   reaches the kernel — approved, rejected by you or by policy, or failed
-   — is HMAC-chained, and it is logged before it can run. Someone who can
-   read and change your files, but cannot run code as you, can read the
-   log but cannot forge entries without the keyring key, nor shorten it
-   unnoticed: the last entry is also witnessed in the OS keyring (on
-   Windows, restoring an old copy of the whole credential store together
-   with the log defeats this; see THREAT_MODEL §4).
-3. **No network from ReliAgent.** The binary makes zero outbound calls. The Python
-   sidecar only talks to `127.0.0.1:11434` (Ollama) — hard-coded, with
-   proxies and redirects ignored. You download the model yourself with
-   `ollama pull`, and every `reli run` checks its SHA-256 against
-   [`MODEL_SHA256.txt`](MODEL_SHA256.txt) before any inference.
+$ reli verify
+[reli] verify ok: 14 entradas, hmac final 57546033a6f9a6dc4e78d44887e1c101eefc6a233e8d637bde091f4fd28f8afe
 
-If those tradeoffs match how you want local agents to behave, this is for
-you. If you need cloud-scale orchestration or production SLAs, this is
-not that.
+# someone edits one row of audit.db by hand…
+$ reli verify
+[reli] error inicializando audit store: audit log corrupted at seq 2: HMAC mismatch (entry or hmac tampered)
+[reli] el log no supera la verificación: no se ejecuta ninguna acción. `reli log` lo muestra y exporta sin modificarlo; …
+```
 
----
+## Quick start
 
-## Status: Research Preview (v0.1.0)
+**No model needed** — try the whole pipeline with the deterministic test
+agent (from a release folder, or a source build as below):
 
-| Area | Status |
-|---|---|
-| Rust kernel (policy engine, sandbox, HMAC chain) | Implemented, 200+ unit tests + property tests. |
-| CLI (`reli run / write / read / ls / verify / log / sandbox / reset / ping`) | Implemented. Messages, `--help` and the approval prompt are in Spanish in v0.1.0. |
-| Python sidecar (orchestrator + critic + Ollama client) | Implemented. Stdlib-only, no runtime dependencies. Tested against a local fake Ollama server and against Ollama 0.31.2, whose network behaviour is audited in [`audits/`](audits/) (run it with `OLLAMA_NO_CLOUD=1`). |
-| Model pinning (`qwen2.5:7b-instruct-q4_K_M`) | Weights SHA-256 pinned and re-checked on every `reli run`. |
-| Red-team suite (26 vectors) | [`tests/red_team.rs`](tests/red_team.rs): 22 run (some only on the platform they target); 4 are pinned as ignored until the feature they test exists — session quota and `grant_scope` (v0.2), byte-exact JCS (next hash format). |
-| Self-contained release (binary + pinned python-build-standalone runtime + sidecar) | Implemented: `scripts/package_release.sh`, built and smoke-tested per platform by the release workflow. |
-| Tauri GUI | Not in v0.1. Planned for v0.2 or later. |
-| `grant_scope` / read allowlist / session quotas | Planned for v0.2. |
-| `execute_code` (WASI / RustPython) | Planned for v0.3. |
+```bash
+./reli ping
+./reli run --mock-llm "write 'hola' to notes/hi.txt"     # answer y to approve
+./reli verify
+```
 
-See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for platform-specific caveats.
+**With the real model** — install [Ollama](https://ollama.com/), then:
 
----
+```bash
+ollama pull qwen2.5:7b-instruct-q4_K_M        # ~4.7 GB, once
+OLLAMA_NO_CLOUD=1 ollama serve                # see "Ollama" below
+./reli run "create a file called notes.txt with a to-do list"
+```
 
 ## Install
 
-Both ways need an [Ollama](https://ollama.com/) install listening on
-`127.0.0.1:11434` with the canonical model pulled, for actual LLM use
-(tests and `--mock-llm` run without it):
+### Ollama
+
+Real inference needs an Ollama listening on `127.0.0.1:11434` with the
+pinned model pulled (tests and `--mock-llm` work without it):
 
 ```bash
 ollama pull qwen2.5:7b-instruct-q4_K_M   # ~4.7 GB
 ```
 
-Then run Ollama with `OLLAMA_NO_CLOUD=1`. Without it, Ollama contacts
+Run Ollama with `OLLAMA_NO_CLOUD=1`. Without it, Ollama contacts
 `ollama.com` on its own at start-up and every few hours (model
 recommendations, cloud catalogue); ReliAgent needs none of that. Details
 in [`audits/ollama_v0.31.2.md`](audits/ollama_v0.31.2.md).
@@ -163,11 +194,12 @@ distributions have both, minimal containers may not.
 
 ### From source
 
-Requirements: Rust **1.85.0** (pinned in
-[`rust-toolchain.toml`](rust-toolchain.toml)) and Python **3.12** with
-[`uv`](https://github.com/astral-sh/uv). On Linux, also the D-Bus headers
-and `pkg-config` (`sudo apt-get install libdbus-1-dev pkg-config` on
-Debian/Ubuntu, `dbus-devel pkgconf` on Fedora).
+Requirements: Rust **1.99.1** (pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml), installed automatically by
+`rustup`) and Python **3.12** with [`uv`](https://github.com/astral-sh/uv).
+On Linux, also the D-Bus headers and `pkg-config`
+(`sudo apt-get install libdbus-1-dev pkg-config` on Debian/Ubuntu,
+`dbus-devel pkgconf` on Fedora).
 
 ```bash
 git clone https://github.com/neomikhe/ReliAgent.git
@@ -200,23 +232,16 @@ mode (`python -I`), so that interpreter must have `reliagent_python`
 installed. To build a release-style directory locally, see
 [`scripts/README.md`](scripts/README.md).
 
----
+## Using `reli`
 
-## First run
+The examples use `./reli` from a release folder; with a source build, use
+`./target/release/reli` (and `RELI_PYTHON` set as above).
 
-The examples use a source build (`./target/release/reli`, with
-`RELI_PYTHON` set as above); from a release, run `./reli` inside the
-extracted folder instead.
+### Ask the agent
 
 ```bash
-# Inspect where things will go (does not create anything yet).
-./target/release/reli sandbox path
-
-# See the audit state.
-./target/release/reli sandbox status
-
-# Ask the agent to write a file.
-./target/release/reli run "create a file called notes.txt with a to-do list"
+./reli sandbox path        # where the agent may work (~/ReliAgent_Sandbox)
+./reli run "create a file called notes.txt with a to-do list"
 ```
 
 Before the first inference, `reli run` checks that Ollama is reachable,
@@ -225,53 +250,41 @@ SHA-256 in [`MODEL_SHA256.txt`](MODEL_SHA256.txt). If any check fails it
 stops and tells you what to do (start Ollama, `ollama pull ...`, or
 re-download a model that does not match).
 
-`reli run` prompts you before any side effect. Answering `n`, letting
-the prompt time out (60 s), or running with `--non-interactive` all
-reject the proposal. In v0.1.0 the CLI's messages, `--help` and the
-approval prompt (`¿aprobar propuesta? [y/N]`) are in Spanish;
-`y`/`yes`/`s`/`si` approve, anything else rejects. The direct commands
-`reli write`, `reli read` and `reli ls` are not prompted: typing the
-command is your approval (they are still policy-checked and logged).
+`reli run` prompts you before any side effect. Answering `n`, letting the
+prompt time out (60 s), or running with `--non-interactive` all reject
+the proposal. In v0.1.0 the CLI's messages, `--help` and the approval
+prompt (`¿aprobar propuesta? [y/N]`) are in Spanish; `y`/`yes`/`s`/`si`
+approve, anything else rejects. `--dry-run` only shows the proposal;
+`--mock-llm` uses the deterministic test agent (the LLM critic is skipped
+too), with everything after it unchanged.
 
 > **`--sandbox` is the jail.** The agent can read and write anything
 > under it, and `reli reset --wipe-everything` deletes everything inside
 > it. Never point `--sandbox` at a directory that holds anything else.
 
-No Ollama at hand? `reli run --mock-llm "write 'hola' to notes/hi.txt"`
-uses a deterministic test agent that understands only simple phrasings
-(the LLM critic is skipped too). Everything after the agent (policy
-engine, approval, audit log) is the same.
+### Direct commands
 
-To start over:
+`reli write <path> <content>`, `reli read <path>` and `reli ls [path]`
+act inside the sandbox without asking: typing the command is your
+approval. They are policy-checked and logged exactly like an agent
+proposal. On a terminal, `reli read` escapes control characters; redirect
+it to get the exact bytes.
 
-```bash
-# Wipes the sandbox, audit DB, anchors and the keyring entries (HMAC key
-# and head witness). Irreversible. Use this instead of deleting
-# ~/.reliagent by hand, which would look like tampering.
-./target/release/reli reset --wipe-everything
-```
-
-All audit logs on the machine share one HMAC key, and `reset` deletes
-it: if you use several `--audit-dir` values, every *other* log stops
-verifying afterwards. Export them with `reli log` first.
-
-### Verifying the log
+### Verify and export the log
 
 ```bash
-./target/release/reli verify
+./reli verify
+./reli log > audit-export.jsonl
 ```
 
 `verify` walks the HMAC chain and cross-checks it against the anchor log
 and the head witness kept in the OS keyring. A successful verification
 prints the number of entries, the most recent HMAC and any action still
-waiting for its outcome. A failure prints the sequence number where tampering was detected,
-and from then on `reli` stays in **read-only mode**: every command that
-would act refuses to run (exit code `3`) until the log verifies again or
-you run `reli reset --wipe-everything`, and nothing is repaired for you.
-
-```bash
-./target/release/reli log > audit-export.jsonl
-```
+waiting for its outcome. A failure prints the sequence number where
+tampering was detected, and from then on `reli` stays in **read-only
+mode**: every command that would act refuses to run (exit code `3`) until
+the log verifies again or you run `reli reset --wipe-everything`, and
+nothing is repaired for you.
 
 `log` prints every entry exactly as it is stored, one JSON object per
 line, and then reports on stderr whether the log verifies (exit `0`) or
@@ -291,9 +304,20 @@ between the two, the next run records the leftover `pending` as
 Only one `reli` process can use the log at a time; a second one waits
 about 2 s and exits with code `6` (busy, not tampering).
 
----
+### Start over
 
-## CLI at a glance
+```bash
+# Wipes the sandbox, audit DB, anchors and the keyring entries (HMAC key
+# and head witness). Irreversible. Use this instead of deleting
+# ~/.reliagent by hand, which would look like tampering.
+./reli reset --wipe-everything
+```
+
+All audit logs on the machine share one HMAC key, and `reset` deletes
+it: if you use several `--audit-dir` values, every *other* log stops
+verifying afterwards. Export them with `reli log` first.
+
+## Command reference
 
 | Command | What it does | Exit codes |
 |---|---|---|
@@ -311,19 +335,53 @@ Global flags: `--sandbox <dir>` (default `~/ReliAgent_Sandbox`),
 `--python-cwd <dir>`, and `--non-interactive`, which turns every approval
 prompt into an auto-reject (use it in CI and scripts).
 
----
+## Security model in brief
 
-## Layout
+| Protects against | Does not protect against |
+|---|---|
+| An LLM (or a prompt injection) proposing writes or reads outside the sandbox | Code running as your user account: it can read the keyring and rewrite the log |
+| Deceptive file names (control, bidi, zero-width, tag characters) | Look-alike letters from other scripts, Unicode normalisation variants |
+| Editing, deleting or truncating the audit log, or planting triggers, views or extra columns in it | Rolling back the OS credential store together with the log (Windows) |
+| Acting without a log entry (power loss, crash, log failure) | Changes to files after the action (the log records actions, not file contents) |
+| A swapped or tampered model file | Ollama's own network traffic, unless you set `OLLAMA_NO_CLOUD=1` |
+| Another account modifying the bundled Python runtime (Linux/macOS) | Another account writing to the release folder on Windows (no ACL check) |
+
+The full analysis, with every vector and residual risk, is in
+[`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md); dependencies are checked
+against public advisory databases before every release
+([`docs/RELEASING.md`](docs/RELEASING.md)). Report vulnerabilities
+privately as described in [`SECURITY.md`](SECURITY.md).
+
+## Status and roadmap
+
+| Area | Status |
+|---|---|
+| Rust kernel (policy engine, sandbox, HMAC chain) | Implemented, 200+ unit tests + property tests. |
+| CLI (`reli run / write / read / ls / verify / log / sandbox / reset / ping`) | Implemented. Messages, `--help` and the approval prompt are in Spanish in v0.1.0. |
+| Python sidecar (orchestrator + critic + Ollama client) | Implemented. Stdlib-only, no runtime dependencies. Tested against a local fake Ollama server and against Ollama 0.31.2, whose network behaviour is audited in [`audits/`](audits/) (run it with `OLLAMA_NO_CLOUD=1`). |
+| Model pinning (`qwen2.5:7b-instruct-q4_K_M`) | Weights SHA-256 pinned and re-checked on every `reli run`. |
+| Red-team suite (27 vectors) | [`tests/red_team.rs`](tests/red_team.rs): 23 run (some only on the platform they target); 4 are pinned as ignored until the feature they test exists — session quota and `grant_scope` (v0.2), byte-exact JCS (next hash format). |
+| CI | Every pull request and every push to `main`: fmt, clippy and all tests on Linux, macOS and Windows, plus the Python suite ([`test.yml`](.github/workflows/test.yml)). Dependabot for crates, Python and actions. |
+| Self-contained release (binary + pinned python-build-standalone runtime + sidecar) | Implemented: `scripts/package_release.sh`, built, smoke-tested, signed and attested per platform by the release workflow. |
+| Tauri GUI | Not in v0.1. Planned for v0.2 or later. |
+| `grant_scope` / read allowlist / session quotas | Planned for v0.2. |
+| `execute_code` (WASI / RustPython) | Planned for v0.3. |
+
+See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for platform-specific caveats
+and the full list of v0.1 limitations, and [`CHANGELOG.md`](CHANGELOG.md)
+for what each release changed.
+
+## Project layout
 
 ```
 ReliAgent/
 ├── src/                    # Rust crate
 │   ├── main.rs
-│   ├── cli.rs
-│   ├── approval.rs         # TTY gate + 60s timeout
+│   ├── cli.rs              # commands, output sanitising, interpreter choice
+│   ├── approval.rs         # TTY gate + 60 s timeout
 │   ├── bridge/             # JSON-RPC over stdin/stdout to Python
 │   └── kernel/
-│       ├── policy.rs       # validate_write_path, size caps
+│       ├── policy.rs       # validate_write_path, size caps, unsafe characters
 │       ├── sandbox.rs      # cap-std capability root
 │       ├── tools.rs        # write_file / read_file / list_dir
 │       ├── audit.rs        # AuditEntry, HMAC chain
@@ -332,7 +390,7 @@ ReliAgent/
 │       ├── head.rs         # head witness (last entry, kept in the keyring)
 │       ├── keyring.rs      # OS keyring binding
 │       └── migrations/     # v1.sql, v2.sql
-├── python-core/            # Python sidecar (uv + hatchling)
+├── python-core/            # Python sidecar (uv, uv_build backend)
 │   └── src/reliagent_python/
 │       ├── orchestrator.py
 │       ├── critic.py
@@ -343,7 +401,7 @@ ReliAgent/
 │       └── __main__.py     # entry point for `python -I -m reliagent_python`
 ├── tests/
 │   ├── bridge_jsonrpc.rs   # cross-process bridge integration
-│   └── red_team.rs         # 26 adversarial vectors
+│   └── red_team.rs         # 27 adversarial vectors
 ├── docs/
 │   ├── THREAT_MODEL.md
 │   ├── HASH_FORMAT.md
@@ -353,33 +411,27 @@ ReliAgent/
 └── .github/                # test.yml (CI), release.yml (cosign + SBOM), Dependabot
 ```
 
----
-
 ## Documentation
 
 | File | When to read it |
 |---|---|
 | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Before trusting any security claim. |
+| [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | Before filing a bug, and for platform caveats. |
 | [`docs/HASH_FORMAT.md`](docs/HASH_FORMAT.md) | If you want to write an independent log verifier. |
 | [`audits/`](audits/) | To see what the targeted Ollama version connects to, and how to turn it off. |
 | [`CHANGELOG.md`](CHANGELOG.md) | To see what changed in each release. |
-| [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) | Before filing a bug. |
 | [`SECURITY.md`](SECURITY.md) | Before reporting a vulnerability. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Before opening a PR. |
+| [`docs/RELEASING.md`](docs/RELEASING.md) | If you maintain releases. |
 | [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Before interacting with the community. |
-
----
 
 ## Contributing
 
-Short version: bug reports and red-team vectors are the best possible
-contribution right now. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
-
-Adversarial paths, canonicalisation edge cases, weird filesystems,
-platform-specific surprises — those are exactly what Research Preview is
-for.
-
----
+Bug reports and red-team vectors are the most useful contribution right
+now: adversarial paths, canonicalisation edge cases, unusual file
+systems, platform-specific surprises — exactly what a Research Preview
+is for. See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues go
+through [`SECURITY.md`](SECURITY.md), never a public issue.
 
 ## Licence
 

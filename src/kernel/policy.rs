@@ -83,12 +83,12 @@ pub fn validate_write_path(raw: &str) -> KernelResult<PathBuf> {
             });
         }
         // Bloquea alternate data streams del NTFS (p. ej. "file.txt:hidden").
-        if let Some(name) = raw.rsplit(['/', '\\']).next() {
-            if name.contains(':') {
-                return Err(KernelError::InvalidPath {
-                    reason: "NTFS alternate data streams are not allowed".into(),
-                });
-            }
+        if let Some(name) = raw.rsplit(['/', '\\']).next()
+            && name.contains(':')
+        {
+            return Err(KernelError::InvalidPath {
+                reason: "NTFS alternate data streams are not allowed".into(),
+            });
         }
     }
 

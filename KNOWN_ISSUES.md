@@ -204,10 +204,14 @@ directory inside your profile.
 
 ### The very first run creates the HMAC key
 
-The key is created the first time any `reli` command needs it. Two
-`reli` processes started at exactly that moment on a machine with no key
-yet may each create one; the log of the one that lost then never
-verifies. Run the first command on a new machine on its own.
+The key is created the first time any `reli` command needs it. After
+storing it, `reli` reads it back and uses what the keyring holds, so two
+processes that create one at the same moment normally end up with the
+same key, and a keyring that does not keep what is written is refused
+instead of silently signing with a key that is gone next time. A window
+of a few milliseconds remains in which two first runs can still end up
+with different keys (one log then never verifies): run the first command
+on a new machine on its own.
 
 ### `abandoned` entries
 

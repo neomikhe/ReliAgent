@@ -65,6 +65,7 @@ rejected.
 | Deceptive names: control characters (CR/LF, ESC, C1), bidi overrides and isolates (`invoice\u202Efdp.exe`), zero-width characters, BOM, Unicode line separators | Rejected as `InvalidPath` for every tool, before any other rule and before I/O, so such a name can never be shown to the approver, created in the sandbox or listed later. The same character set is escaped whenever the CLI prints text of external origin. |
 | Empty components collapsing to `..` (`foo//../bar`) | `Path::components` still emits `ParentDir`; rejected. |
 | Symlink-swap TOCTOU | `cap-std` opens every file through the sandbox capability; it does not follow symlinks that escape the root. |
+| Symlink whose target ends in a separator, or names another link (`chained -> up/`, `up -> ../outside`) | Fixed in `cap-primitives` 4.0.3 (RUSTSEC-2026-0482); vector 27 checks both cap-std itself and every tool. `list_dir` also checks the target's metadata before listing, which already blocked it in ReliAgent's tools. |
 
 ### 3.2 Content-based attacks
 
@@ -184,9 +185,10 @@ They are documented here so no user is surprised.
 - **Audit directory ACLs on Windows.** `reli` sets no ACL of its own: a
   custom `--audit-dir` outside the user profile inherits its parent's
   permissions, which may let other local users read or modify it.
-- **First-run key race.** Two `reli` processes that both find no HMAC
-  key at the same moment may each create one; one log then never
-  verifies (fail closed, but unusable).
+- **First-run key race.** A new key is read back from the keyring after
+  it is stored, so concurrent first runs normally share one; a window of
+  milliseconds remains in which two can still end up with different keys
+  and one log then never verifies (fail closed, but unusable).
 - **The HMAC key in memory.** While `reli` runs, the key is ordinary
   process memory: the OS may page it to swap or a hibernation file, and a
   crash dump may contain it.

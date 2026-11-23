@@ -41,6 +41,11 @@ attestations, which go to the public Sigstore transparency log for good.
      `python-core/src/reliagent_python/main.py`: if the release targets a
      new Ollama version, audit it first
      ([`audits/README.md`](../audits/README.md)).
+5. No open advisory for any locked dependency: the repository's
+   **Security → Dependabot alerts** list is empty, or an
+   [OSV](https://osv.dev) query of every package in `Cargo.lock` and
+   `python-core/uv.lock` returns nothing. Fix before tagging, never after:
+   a published release cannot be patched in place.
 
 ## Dependency updates (Dependabot)
 
@@ -55,7 +60,11 @@ attestations, which go to the public Sigstore transparency log for good.
     audit-log test vectors must still pass unchanged: the HMAC bytes are
     the log format.
   - `rusqlite` majors change the bundled SQLite and its API; re-run the
-    `LogReader` tests that pin read-only behaviour.
+    `LogReader` tests that pin read-only behaviour. (Done once already:
+    0.32 → 0.41 for CVE-2026-119375, which also needed Rust 1.99.)
+  - `cap-std` / `cap-primitives`: red-team vector 27 only exercises the
+    portable resolver on macOS and Windows (and on Linux without
+    `openat2`); check the macOS and Windows CI jobs, not just Linux.
   - Actions used by `release.yml` (`download-artifact`,
     `attest-build-provenance`, `action-gh-release`, `checkout`): change
     them one at a time and check the next release draft.

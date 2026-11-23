@@ -86,10 +86,10 @@ impl AuditStore {
             )));
         }
 
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                super::create_private_dir_all(parent)?;
-            }
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            super::create_private_dir_all(parent)?;
         }
 
         let conn = Connection::open(db_path)
@@ -741,8 +741,12 @@ fn harden_connection(conn: &Connection) -> KernelResult<()> {
         .map_err(|e| busy_or("set trusted_schema", e))?;
     conn.pragma_update(None, "cell_size_check", "ON")
         .map_err(|e| busy_or("set cell_size_check", e))?;
-    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES);
-    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 64);
+    // Sin estos límites no se sigue: un archivo hostil podría forzar
+    // reservas de memoria enormes.
+    conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+        .map_err(|e| busy_or("set length limit", e))?;
+    conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 64)
+        .map_err(|e| busy_or("set column limit", e))?;
     Ok(())
 }
 

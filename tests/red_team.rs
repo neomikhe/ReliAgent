@@ -151,6 +151,101 @@ fn v03_symlink_swap_toctou() {
 }
 
 // ---------------------------------------------------------------------------
+// Vector 27 — Symlink whose target ends in a separator (RUSTSEC-2026-0482).
+// cap-primitives < 4.0.3 re-added a trailing slash to the last path
+// component, so the no-follow open no longer applied and a symlink inside
+// the sandbox led outside it — for listings, reads and writes. A target
+// ending in a separator triggers it without any slash in the caller's path,
+// so the path normalisation in `validate_write_path` is not enough on its
+// own: this vector pins the fixed dependency.
+//
+// The vulnerable resolver is the one cap-primitives uses on Windows and
+// macOS, and on Linux only without `openat2` (old kernels, or a seccomp
+// policy that rejects it). On Windows, creating a symlink needs Developer
+// Mode or admin rights; without them the vector is skipped (GitHub's
+// Windows runners have them).
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+fn plant_dir_symlink(target: &std::ffi::OsStr, link: &std::path::Path) -> bool {
+    std::os::unix::fs::symlink(target, link).expect("create symlink");
+    true
+}
+
+#[cfg(windows)]
+fn plant_dir_symlink(target: &std::ffi::OsStr, link: &std::path::Path) -> bool {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    match std::os::windows::fs::symlink_dir(target, link) {
+        Ok(()) => true,
+        Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => false,
+        Err(e) => panic!("create symlink: {e}"),
+    }
+}
+
+#[test]
+fn v27_symlink_with_trailing_separator_target_does_not_escape() {
+    let sep = std::path::MAIN_SEPARATOR;
+    let outside_tmp = TempDir::new().expect("outside tmp");
+    let outside = outside_tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"original").unwrap();
+
+    let (inside_tmp, sandbox) = new_sandbox();
+    // Both temporary directories are siblings under the system temp dir.
+    assert_eq!(inside_tmp.path().parent(), outside_tmp.path().parent());
+    let root = inside_tmp.path();
+    // `escape` -> <outside>/ (absolute, trailing separator).
+    let mut absolute = outside.as_os_str().to_owned();
+    absolute.push(sep.to_string());
+    if !plant_dir_symlink(&absolute, &root.join("escape")) {
+        eprintln!("[red-team v27] SKIPPED: this account cannot create symlinks");
+        return;
+    }
+    // `up` -> ../<outside tmp>/outside, and the advisory's case:
+    // `chained` -> up/ (a target ending in a separator that names a link).
+    let up = format!(
+        "..{sep}{}{sep}outside",
+        outside_tmp.path().file_name().unwrap().to_string_lossy()
+    );
+    plant_dir_symlink(up.as_ref(), &root.join("up"));
+    plant_dir_symlink(format!("up{sep}").as_ref(), &root.join("chained"));
+    assert!(
+        root.join("chained").join("secret.txt").exists(),
+        "the links must really reach the outside directory"
+    );
+
+    // The dependency itself (fixed in cap-primitives 4.0.3): with the
+    // vulnerable resolver these listings returned the outside directory.
+    for p in ["escape/", "up/", "chained", "chained/"] {
+        assert!(
+            sandbox.dir().read_dir(p).is_err(),
+            "{p}: cap-std listed a directory outside the sandbox"
+        );
+    }
+    // And every reli tool on top of it.
+    for link in ["escape", "up", "chained", "escape/", "up/", "chained/"] {
+        assert!(list_dir(&sandbox, link).is_err(), "{link}: listing escaped");
+    }
+    for path in ["escape/secret.txt", "up/secret.txt", "chained/secret.txt"] {
+        assert!(read_file(&sandbox, path).is_err(), "{path}: read escaped");
+        assert!(
+            write_file(&sandbox, path, b"pwned").is_err(),
+            "{path}: write escaped"
+        );
+    }
+    for path in ["escape/new.txt", "chained/new.txt"] {
+        assert!(write_file(&sandbox, path, b"pwned").is_err(), "{path}");
+    }
+    assert_eq!(
+        std::fs::read(outside.join("secret.txt")).unwrap(),
+        b"original"
+    );
+    assert!(
+        !outside.join("new.txt").exists(),
+        "a file was created outside"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Vector 4 — Absolute Windows path.
 // On any platform, `C:\Windows\...` must be rejected. On Windows the drive
 // prefix rule hits first; on unix it's parsed as a relative segment
@@ -228,8 +323,7 @@ fn v08_empty_components_collapse_to_traversal() {
 #[test]
 fn v09_very_long_path() {
     let segment = "a".repeat(64);
-    let long = std::iter::repeat(segment.as_str())
-        .take(8)
+    let long = std::iter::repeat_n(segment.as_str(), 8)
         .collect::<Vec<_>>()
         .join("/"); // ~520 chars
 

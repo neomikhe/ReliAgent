@@ -157,7 +157,15 @@ pub fn load_or_create_audit_key() -> KernelResult<(Vec<u8>, bool)> {
     audit_key_entry()?
         .set_password(&hex::encode(&key))
         .map_err(|e| KernelError::Keyring(format!("store new key: {e}")))?;
-    Ok((key, true))
+    // Se usa la clave que quedó guardada, no la generada: si otro proceso
+    // creó la suya a la vez, los dos firman con la misma (aún no se ha
+    // firmado nada). Un llavero que no conserva lo escrito se detecta aquí,
+    // en vez de dejar cada log firmado con una clave distinta.
+    let stored = load_audit_key()?.ok_or_else(|| {
+        KernelError::Keyring("the new HMAC key could not be read back from the keyring".into())
+    })?;
+    let created_here = stored == key;
+    Ok((stored, created_here))
 }
 
 pub fn account_label() -> String {

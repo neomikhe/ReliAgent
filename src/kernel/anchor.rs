@@ -81,10 +81,10 @@ impl AnchorLog {
 
     pub fn latest(&self) -> KernelResult<Option<AnchorRow>> {
         let current = self.dir.join(ANCHOR_FILENAME);
-        if current.exists() {
-            if let Some(row) = last_row_of(&current)? {
-                return Ok(Some(row));
-            }
+        if current.exists()
+            && let Some(row) = last_row_of(&current)?
+        {
+            return Ok(Some(row));
         }
         let mut highest: u64 = 0;
         let mut highest_path: Option<PathBuf> = None;
@@ -92,15 +92,13 @@ impl AnchorLog {
             let prefix = format!("{ANCHOR_FILENAME}.");
             for entry in entries.flatten() {
                 let p = entry.path();
-                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-                    if let Some(suffix) = name.strip_prefix(&prefix) {
-                        if let Ok(n) = suffix.parse::<u64>() {
-                            if n >= highest {
-                                highest = n;
-                                highest_path = Some(p);
-                            }
-                        }
-                    }
+                if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                    && let Some(suffix) = name.strip_prefix(&prefix)
+                    && let Ok(n) = suffix.parse::<u64>()
+                    && n >= highest
+                {
+                    highest = n;
+                    highest_path = Some(p);
                 }
             }
         }
@@ -115,12 +113,11 @@ impl AnchorLog {
         let mut count: u64 = 0;
         let prefix = format!("{ANCHOR_FILENAME}.");
         for entry in std::fs::read_dir(&self.dir)?.flatten() {
-            if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
-                if let Some(suffix) = name.strip_prefix(&prefix) {
-                    if suffix.parse::<u64>().is_ok() {
-                        count += 1;
-                    }
-                }
+            if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
+                && let Some(suffix) = name.strip_prefix(&prefix)
+                && suffix.parse::<u64>().is_ok()
+            {
+                count += 1;
             }
         }
         Ok(count)

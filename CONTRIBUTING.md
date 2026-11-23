@@ -47,7 +47,7 @@ vectors, platform weirdness, missed edge cases in the policy engine.
 ## Dev setup
 
 ```bash
-# Rust toolchain is pinned to 1.85.0 in rust-toolchain.toml
+# Rust toolchain is pinned to 1.99.1 in rust-toolchain.toml
 cargo --version
 rustc --version
 

@@ -15,10 +15,10 @@ pub fn write_file(sandbox: &Sandbox, path: &str, content: &[u8]) -> KernelResult
 
     let safe_path = validate_write_path(path)?;
 
-    if let Some(parent) = safe_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            sandbox.dir().create_dir_all(parent)?;
-        }
+    if let Some(parent) = safe_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        sandbox.dir().create_dir_all(parent)?;
     }
 
     sandbox.dir().write(&safe_path, content)?;

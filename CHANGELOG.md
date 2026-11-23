@@ -39,7 +39,7 @@ the file system; its outcome is recorded in a tamper-evident audit log.
   release.
 - Logs written by earlier development builds (format v1) are migrated
   one way to v2 on first open, with a backup (`audit.db.schema1.bak`).
-- Red-team suite of 26 vectors (`tests/red_team.rs`); 4 are pinned as
+- Red-team suite of 27 vectors (`tests/red_team.rs`); 4 are pinned as
   ignored until the features they test exist.
 
 ### Python sidecar
@@ -62,6 +62,22 @@ the file system; its outcome is recorded in a tamper-evident audit log.
   job, with build provenance attestations and SPDX/CycloneDX SBOMs.
 - On Linux and macOS `reli` refuses a bundled runtime that other users
   can modify.
+
+### Security
+- Dependencies checked against the OSV / RustSec advisory databases
+  before release; none open. Fixed on the way:
+  - `cap-primitives` 4.0.3 (RUSTSEC-2026-0482): a symlink whose target
+    ends in a path separator could lead a directory listing out of the
+    sandbox through cap-std's portable resolver (used on Windows and
+    macOS). ReliAgent's own tools were not exploitable thanks to their
+    metadata check, but the dependency is fixed and red-team vector 27
+    pins it.
+  - Bundled SQLite 3.54.1 via `rusqlite` 0.41 (CVE-2026-119375,
+    RUSTSEC-2026-0459: uninitialised memory with a crafted `-wal` file).
+  - `rustix` 1.1.6, `anyhow` 1.0.104 and `time` 0.3.55, for advisories in
+    functions ReliAgent does not call.
+- Rust toolchain 1.99.1 (needed by the fixed SQLite).
+- A newly created HMAC key is read back from the keyring before use.
 
 ### Known limitations
 See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) and
