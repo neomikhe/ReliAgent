@@ -10,7 +10,6 @@
 # --- Root: only what the project needs --------------------------------
 /*
 !/.gitattributes
-!/.gitignore
 !/.github/
 !/CHANGELOG.md
 !/CODE_OF_CONDUCT.md
