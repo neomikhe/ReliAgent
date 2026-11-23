@@ -42,6 +42,24 @@ attestations, which go to the public Sigstore transparency log for good.
      new Ollama version, audit it first
      ([`audits/README.md`](../audits/README.md)).
 
+## Dependency updates (Dependabot)
+
+- **Grouped minor/patch PRs** (one per ecosystem): merge when
+  `test.yml` is green.
+- **Major updates** get one PR each. Read the changelog first; known
+  traps:
+  - `sigstore/cosign-installer` v4 installs cosign v3, whose `sign-blob`
+    requires `--bundle`: the signing step in `release.yml` and every
+    verification command in the docs must change together with it.
+  - `sha2` and `hmac` must move together (same `digest` major), and the
+    audit-log test vectors must still pass unchanged: the HMAC bytes are
+    the log format.
+  - `rusqlite` majors change the bundled SQLite and its API; re-run the
+    `LogReader` tests that pin read-only behaviour.
+  - Actions used by `release.yml` (`download-artifact`,
+    `attest-build-provenance`, `action-gh-release`, `checkout`): change
+    them one at a time and check the next release draft.
+
 ## Tag and build
 
 ```bash
