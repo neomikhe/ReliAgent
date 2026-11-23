@@ -1,0 +1,127 @@
+# ReliAgent — tests on every pull request and on pushes to main.
+#
+# rust:   fmt, clippy and every test (unit, integration, red-team, and the
+#         sidecar bridge tests that need reliagent_python installed) on
+#         Linux, macOS and Windows.
+# python: the sidecar's pytest suite.
+#
+# No release builds and no signing here (see release.yml). Runs with a
+# read-only token and no secrets, also for pull requests from forks
+# (`pull_request`, never `pull_request_target`). Every action is pinned to
+# a full commit SHA (version in the comment); Dependabot keeps the pins
+# current (.github/dependabot.yml).
+
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request cancels the older run; runs on
+# main always finish, so every commit there has a complete result.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # uv itself, pinned like everything else (a release at least two weeks
+  # old) and one whose checksum the pinned setup-uv knows, so the download
+  # is verified. Dependabot does not update these two: see docs/RELEASING.md.
+  UV_VERSION: "0.13.6"
+  # The same CPython the release bundles (scripts/pbs.lock), managed by uv
+  # (hash-checked download), not whatever the runner image has.
+  PYTHON_VERSION: "3.12.16"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # keyring's Secret Service backend links libdbus (found through
+      # pkg-config); the macOS and Windows backends need nothing.
+      - name: system libraries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      # The toolchain version comes from rust-toolchain.toml.
+      - name: install rust
+        shell: bash
+        run: |
+          channel="$(awk -F'"' '/^channel/ { print $2 }' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --component clippy,rustfmt
+          rustup default "${channel}"
+
+      # Pull requests restore the cache but never save it: only main fills
+      # it. release.yml uses no cache at all.
+      - name: cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      # The bridge tests start the real sidecar with `python -I`, so the
+      # interpreter they use must have reliagent_python installed.
+      - name: sidecar environment
+        shell: bash
+        working-directory: python-core
+        run: uv sync --locked --extra dev --managed-python --python "${PYTHON_VERSION}"
+
+      - name: fmt + clippy
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: tests
+        shell: bash
+        run: |
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              RELI_TEST_PYTHON="$(cygpath -w "${GITHUB_WORKSPACE}/python-core/.venv/Scripts/python.exe")"
+          else
+              RELI_TEST_PYTHON="${GITHUB_WORKSPACE}/python-core/.venv/bin/python"
+          fi
+          export RELI_TEST_PYTHON
+          cargo test --locked
+          cargo test --locked --test bridge_jsonrpc -- --ignored
+
+  python:
+    name: python sidecar
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: pytest
+        working-directory: python-core
+        run: |
+          uv sync --locked --extra dev --managed-python --python "${PYTHON_VERSION}"
+          uv run --locked pytest

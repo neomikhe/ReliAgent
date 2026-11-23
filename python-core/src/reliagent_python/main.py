@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 from typing import Any, Callable
@@ -72,6 +73,13 @@ RPC_MODEL_INTEGRITY = -32012
 RPC_LLM_ERROR = -32013
 
 _BACKENDS = ("ollama", "mock")
+
+# Versiones de Ollama cuyo comportamiento de red se ha comprobado
+# (audits/ollama_v<versión>.md). Otra versión funciona, pero se avisa.
+AUDITED_OLLAMA_VERSIONS = ("0.31.2",)
+# Lo que responde en el puerto no es de confianza: solo se repite en la
+# terminal si tiene forma de versión.
+_VERSION_SHAPE = re.compile(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-[0-9A-Za-z.]{1,32})?")
 
 
 def _log(msg: str) -> None:
@@ -111,12 +119,24 @@ def _make_ollama_client(tag: str) -> OllamaClient:
     return OllamaClient(tag)
 
 
+def _warn_if_unaudited(version: str) -> None:
+    """Aviso (no bloquea): una versión nueva de Ollama puede tener otro
+    comportamiento de red que nadie ha comprobado todavía."""
+    if version in AUDITED_OLLAMA_VERSIONS:
+        return
+    shown = version if _VERSION_SHAPE.fullmatch(version) else "(unrecognised version string)"
+    _log(
+        f"warning: Ollama {shown} has not been audited by ReliAgent "
+        f"(audited: {', '.join(AUDITED_OLLAMA_VERSIONS)}); see audits/ in the repository"
+    )
+
+
 def _verified_ollama_client() -> OllamaClient:
     """Comprueba daemon, modelo e integridad antes de cualquier inferencia."""
     pin = CANONICAL_MODEL
     client = _make_ollama_client(pin.tag)
     try:
-        client.version()
+        _warn_if_unaudited(client.version())
         info = client.show()
         _log(f"verifying SHA-256 of {pin.tag} ({pin.size / 1e9:.1f} GB)...")
         verify_model(info, pin)

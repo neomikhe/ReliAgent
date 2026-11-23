@@ -117,6 +117,33 @@ class TestOllamaBackend:
         assert len(chats) == 2  # agente + crítico LLM
         assert all(c.body["model"] == "test:1b" for c in chats)
 
+    def _approve(self, ollama_backend):
+        ollama_backend.respond_json(
+            "POST", "/api/chat", _chat(AGENT_PROPOSAL), _chat({"verdict": "approve"})
+        )
+        return _agent_run({"prompt": "crea notes/a.txt", "backend": "ollama"})["result"]
+
+    def test_audited_ollama_version_is_not_flagged(self, ollama_backend, capsys):
+        self._approve(ollama_backend)
+        assert "not been audited" not in capsys.readouterr().err
+
+    def test_unaudited_ollama_version_warns_but_still_runs(self, ollama_backend, capsys):
+        ollama_backend.respond_json("GET", "/api/version", {"version": "0.99.0-rc1"})
+        assert self._approve(ollama_backend)["verdict"] == "approve"
+        err = capsys.readouterr().err
+        assert "not been audited" in err
+        assert "0.99.0-rc1" in err
+        assert "0.31.2" in err
+
+    def test_odd_version_string_is_never_echoed(self, ollama_backend, capsys):
+        # Lo que responde en el puerto no es de confianza (puede no ser Ollama).
+        hostile = "1.0\x1b[2J\u202e; rm -rf ~"
+        ollama_backend.respond_json("GET", "/api/version", {"version": hostile})
+        self._approve(ollama_backend)
+        err = capsys.readouterr().err
+        assert "not been audited" in err
+        assert "\x1b" not in err and "\u202e" not in err and "rm -rf" not in err
+
     def test_llm_critic_can_reject(self, ollama_backend):
         ollama_backend.respond_json(
             "POST",

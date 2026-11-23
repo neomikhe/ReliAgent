@@ -46,8 +46,9 @@ standards above:
   follow [`SECURITY.md`](SECURITY.md). Dropping a working exploit into
   a public issue before a fix ships is a Code of Conduct violation.
 - **Do not pressure users into disabling safeguards.** Telling someone
-  to "just run with `--non-interactive` and ignore the approval prompts"
-  because it is more convenient for you is not acceptable.
+  to "just answer `y` to everything", to point `--sandbox` at their home
+  directory, or to skip verifying a release because it is more
+  convenient for you is not acceptable.
 - **Do not impersonate the maintainers.** If you are not a maintainer,
   do not reply to security reports as if you were.
 
@@ -73,10 +74,12 @@ officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may
-be reported to the project maintainers at
-`conduct@<project-domain>` (address published with the first public
-release) or via a private GitHub message to a maintainer. All complaints
-will be reviewed and investigated promptly and fairly.
+be reported to the project maintainers privately, through the contact
+options on the maintainer's GitHub profile
+(<https://github.com/neomikhe>). Please do not describe conduct problems
+in a public issue; if you find no private contact there, open an issue
+that only asks the maintainer to contact you, without details. All
+complaints will be reviewed and investigated promptly and fairly.
 
 All maintainers are obligated to respect the privacy and security of the
 reporter of any incident.

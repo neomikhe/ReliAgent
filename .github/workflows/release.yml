@@ -24,10 +24,11 @@
 # identity of each tag:
 #   cosign verify-blob \
 #       --certificate <archive>.cert --signature <archive>.sig \
-#       --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
+#       --certificate-identity "https://github.com/neomikhe/ReliAgent/.github/workflows/release.yml@refs/tags/<tag>" \
 #       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
 #       <archive>
-#   gh attestation verify <archive> --repo <owner>/<repo>
+#   gh attestation verify <archive> --repo neomikhe/ReliAgent \
+#       --signer-workflow neomikhe/ReliAgent/.github/workflows/release.yml
 
 name: release
 
@@ -50,17 +51,17 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             binary: reli
             platform: linux-x86_64
             ext: tar.gz
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15
             binary: reli
             platform: macos-aarch64
             ext: tar.gz
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            runner: windows-2025
             binary: reli.exe
             platform: windows-x86_64
             ext: zip
@@ -113,16 +114,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
 
-      - name: cache cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
+      # No cargo cache here, on purpose: a tag run can restore caches saved
+      # on `main`, and test.yml runs third-party build scripts there. A
+      # poisoned target/ would end up in a binary signed by this workflow.
+      # Never add a cache (or a shared-key with test.yml) to this job.
 
       - name: fmt + clippy
         shell: bash
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --release --target "${TARGET}" -- -D warnings
+          cargo clippy --all-targets --release --locked --target "${TARGET}" -- -D warnings
 
       - name: build
         shell: bash
@@ -262,7 +263,8 @@ jobs:
                 --certificate-oidc-issuer https://token.actions.githubusercontent.com \
                 <archive>
 
-            gh attestation verify <archive> --repo ${{ github.repository }}
+            gh attestation verify <archive> --repo ${{ github.repository }} \
+                --signer-workflow ${{ github.repository }}/.github/workflows/release.yml
             ```
 
             `<archive>` is `reli-${{ github.ref_name }}-linux-x86_64.tar.gz`,
@@ -274,6 +276,6 @@ jobs:
             Extract as the user who will run `reli`, into a directory only that
             user can write: `reli` trusts the `python/` next to it.
 
-            See [`docs/THREAT_MODEL.md`](../blob/${{ github.ref_name }}/docs/THREAT_MODEL.md)
-            and [`KNOWN_ISSUES.md`](../blob/${{ github.ref_name }}/KNOWN_ISSUES.md)
+            See [`docs/THREAT_MODEL.md`](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/THREAT_MODEL.md)
+            and [`KNOWN_ISSUES.md`](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/KNOWN_ISSUES.md)
             before deploying.

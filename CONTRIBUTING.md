@@ -27,7 +27,7 @@ vectors, platform weirdness, missed edge cases in the policy engine.
 - **Documentation fixes.** Including "this sentence in the README is
   technically true but confused me for 20 minutes."
 - **Portability patches** for platforms we haven't exercised (BSDs,
-  musl, Alpine, NixOS, macOS on Apple Silicon vs Intel).
+  musl, Alpine, NixOS, macOS on Intel, Linux on ARM).
 
 ## What we are cautious about
 
@@ -41,7 +41,7 @@ vectors, platform weirdness, missed edge cases in the policy engine.
   change to the HMAC input needs a `hash_format_version` bump and a
   migration. We will not trade correctness for throughput.
 - **Dependency additions.** We keep the dependency graph narrow and
-  audited. A new crate in `Cargo.toml` needs a one-paragraph
+  pinned (`Cargo.lock`, `uv.lock`). A new crate in `Cargo.toml` needs a one-paragraph
   justification in the PR description.
 
 ## Dev setup
@@ -71,7 +71,9 @@ Run the full local check matrix before pushing:
 cargo fmt --all -- --check
 cargo clippy --all-targets --release -- -D warnings
 cargo test                              # unit + integration (Rust)
-cargo test -- --ignored                 # real sidecar bridge, needs venv
+cargo test --test bridge_jsonrpc -- --ignored   # real sidecar bridge, needs venv
+# (not plain `cargo test -- --ignored`: that also runs the red-team
+# vectors pinned as ignored, which are expected to fail)
 cd python-core && uv run pytest && cd ..
 ```
 
@@ -85,7 +87,7 @@ RELI_TEST_PYTHON="$PWD/python-core/.venv/bin/python" cargo test           # Linu
 ```
 
 If you move the checkout to another directory, run `cargo clean` and
-re-create the venv (`rm -rf python-core/.venv && uv sync`): test binaries
+re-create the venv (`rm -rf python-core/.venv && (cd python-core && uv sync --extra dev)`): test binaries
 embed the old absolute path and fail with "directory name is invalid".
 
 None of the tests need Ollama; they use a local fake server.
@@ -116,8 +118,8 @@ If you add a vector, it must appear here with a passing (or documented
   small pure functions over classes where a module-level function
   suffices.
 - **Tests.** Integration tests in `tests/`, unit tests alongside the
-  code. Name red-team tests `vNN_short_description` and match them to
-  the vector list in `PROJECT_CONTEXT.md §16` if possible.
+  code. Name red-team tests `vNN_short_description`, taking the next
+  free number in `tests/red_team.rs`.
 - **Commits.** Conventional-ish: `feat:`, `fix:`, `docs:`, `test:`,
   `refactor:`, `chore:`. English. Imperative mood. Body wraps at 72
   columns.
@@ -130,13 +132,18 @@ If you add a vector, it must appear here with a passing (or documented
 1. Fork, branch, commit.
 2. Run the check matrix above. A PR that fails CI on first push is
    expected occasionally, but please make sure it passes locally first.
+   CI ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs
+   fmt, clippy and every Rust test — including the sidecar bridge tests —
+   on Linux, macOS and Windows, plus the Python tests. Dependabot opens
+   weekly update PRs for crates, the sidecar's `uv.lock` and the pinned
+   actions, only for releases at least two weeks old.
 3. Open the PR against `main`. Describe:
    - What the change does.
    - Why (especially if it touches the audit format or threat model).
    - How you tested it. If you added a test, which file / which vector.
    - Any threat-model implications.
-4. Expect review. Security-adjacent changes go through two reviewers
-   when possible.
+4. Expect review. During the Research Preview there is a single
+   maintainer, so security-adjacent changes may take longer to review.
 
 ## Commit signing
 
@@ -158,7 +165,7 @@ Participating in this project means agreeing to the
 
 ## Questions that are not a PR yet
 
-- File an issue with the `question` label.
+- Open an issue and say in the title that it is a question.
 - If it's a design question about the threat model or audit format,
   cross-reference the section of `docs/THREAT_MODEL.md` or
   `docs/HASH_FORMAT.md` you are asking about.

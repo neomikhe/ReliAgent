@@ -2,18 +2,19 @@
 
 > **Status:** Research Preview. This document describes what v0.1.0 actually
 > defends against today, not what future versions aim to achieve. Anything
-> outside the "In scope" section is **explicitly out of scope**.
+> not listed in §3 is out of scope; §4 lists what is known not to be fully
+> covered, §5 what is excluded by policy.
 
 ## Purpose
 
-ReliAgent is a local trusted kernel for AI agents: a policy engine and a
+ReliAgent is a local policy-and-audit kernel for AI agents: a policy engine and a
 tamper-evident audit log that sit between an LLM orchestrator and the
 user's filesystem. This document enumerates the actors, assets, attack
-vectors and mitigations we considered while building v0.1.0, and is linked
-from every user-facing doc that makes a security claim.
+vectors and mitigations we considered while building v0.1.0.
 
 If ReliAgent's behaviour ever contradicts this document, the contradiction
-is a bug. Open an issue against this file in the same PR.
+is a bug. Report it as an issue (privately, via SECURITY.md, if it weakens
+a security claim); the PR that fixes it updates this file too.
 
 ---
 
@@ -36,17 +37,20 @@ is a bug. Open an issue against this file in the same PR.
 |---|---|---|
 | A | Files **outside** the sandbox root (`~/ReliAgent_Sandbox/`). | Writes forbidden by default; path validation + `cap-std` capability. Reads follow the same rule (v0.2 will add an opt-in read allowlist with per-file approval). |
 | B | Integrity of the action log. | Linear HMAC-SHA256 chain over every recorded entry; `anchor.log` as external witness against truncation. |
-| C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, the Secret Service over D-Bus on Linux). Never written to disk in plaintext, never logged. |
-| D | Approval gate. | TTY prompt before any mutating proposal executes. In non-interactive mode or without a TTY, the default is **reject**. |
+| C | HMAC key. | Stored in the OS keyring (Windows Credential Manager, macOS Keychain, the Secret Service over D-Bus on Linux). `reli` never writes it to a file or a log; while running it is held in ordinary process memory (not locked or zeroed), so swap, hibernation files or crash dumps may contain it (§4). |
+| D | Approval gate. | TTY prompt before any agent proposal executes. In non-interactive mode or without a TTY, the default is **reject**. The direct `reli write` / `read` / `ls` commands are not prompted: typing the command is the approval. |
 | E | Privacy of the user. | Zero outbound network traffic from `reli` itself. The Python sidecar talks to Ollama on `127.0.0.1:11434` only: the host is hard-coded, and `OLLAMA_HOST`, proxy environment variables and HTTP redirects are ignored. Model downloads happen only when the user runs `ollama pull`. |
 
 ---
 
 ## 3. Vectors and mitigations
 
-All vectors below are exercised by `tests/red_team.rs`. Mitigations live in
-deterministic Rust code — the LLM critic is a second layer only and
-**cannot** approve anything the engine rejected.
+Every vector below has a test: path and content vectors in
+`tests/red_team.rs`, audit-log vectors mainly in `src/kernel/store.rs` and
+`src/kernel/audit.rs`, approval vectors in `src/approval.rs` and
+`src/cli.rs`. Mitigations live in deterministic Rust code — the LLM critic
+is a second layer only and **cannot** approve anything the engine
+rejected.
 
 ### 3.1 Path-based attacks
 
@@ -88,7 +92,7 @@ deterministic Rust code — the LLM critic is a second layer only and
 | Side effect with no log entry (crash, power loss or log failure between acting and logging) | **Log before act:** a `pending` entry is committed with `synchronous = FULL` (plus `fullfsync` on macOS), and its anchor line and head witness are written, before approval and execution; if any of that fails, nothing runs. A `pending` left without outcome is closed as `error`/`abandoned` ("may or may not have run") by the next session, which names it on the terminal. |
 | Two `reli` processes racing on the log (or one closing the other's in-flight `pending` as abandoned) | The database is opened with an exclusive file lock; a second process (including `reli reset`) waits about 2 s and exits with code `6`. |
 | Forged or inconsistent outcome (resolving a non-pending row, resolving twice, outcome for different args) | Checked by `verify()` for every v2 row, plus a `UNIQUE` index on `resolves_seq`. Only possible at all with the HMAC key. |
-| Acting on, or destroying evidence in, a log that fails verification | **Read-only mode:** every command that would act refuses (exit `3`) and names the first bad entry. `reli log` exports the rows as stored and then reports where verification fails. It uses a read-only SQLite connection with no checkpoint on close and refuses to open files SQLite would rewrite even when reading (a pending journal, a WAL next to an empty database); it never migrates, closes orphans, writes anchors or witnesses, or creates a key. Its output escapes control and invisible characters as JSON. Nothing is repaired automatically and there is no `--force`. |
+| Acting on, or destroying evidence in, a log that fails verification | **Read-only mode:** every command that would act refuses (exit `3`) and names the first bad entry. `reli log` exports the rows as stored and then reports where verification fails. It uses a read-only SQLite connection with no checkpoint on close and refuses to open files SQLite would rewrite even when reading (a pending journal, a WAL next to an empty database); it never migrates, closes orphans, writes anchors or witnesses, or creates a key. Its output escapes control and invisible characters as JSON. Nothing is repaired automatically and no flag overrides it (`reset --force` only skips the `WIPE` prompt). |
 | Another local account reading the log (paths and times of everything the agent did) | On Linux/macOS the audit directory and its `anchors/` are created `0700`, and `reli` warns when an existing audit directory is readable or writable by others. On Windows the default directory inherits the profile's private ACL; a custom `--audit-dir` does not (residual, see §4). |
 
 ### 3.4 Orchestration / approval attacks
@@ -101,7 +105,7 @@ deterministic Rust code — the LLM critic is a second layer only and
 | A human approving (or hiding) a rule-violating proposal | Path and size rules run **before** the prompt; a violation is logged as `rejected` / `policy: …` and the human is not asked. |
 | Using the log as a data channel (an LLM-chosen path stored in clear) | Arguments are only stored as `args_hash`; refusal reasons are fixed codes (`policy: path_outside_sandbox`, `io: NotFound`, …), never the path or OS error text. |
 | Orchestrator forging a proposal as "already approved" | The Rust kernel owns the approval gate; the Python side can only *propose*. |
-| LLM critic "approving" a rule-violating action | The critic is architecturally downstream of the policy engine and can only reject further. A critic approval never overrides a hard-rule rejection. |
+| LLM critic "approving" a rule-violating action | Both critics run in the sidecar *before* the proposal reaches the kernel and can only reject; whatever they pass still goes through the Rust policy engine and the TTY gate. A critic approval never overrides a hard-rule rejection. |
 
 ---
 
@@ -111,9 +115,9 @@ These are things ReliAgent v0.1.0 does **not** fully defend against.
 They are documented here so no user is surprised.
 
 - **Code execution as the user.** If an attacker runs arbitrary code as the
-  user account, they can read the keyring, decrypt or forge log entries,
+  user account, they can read the HMAC key and forge or rewrite log entries,
   replace the binary on disk, or intercept TTY approvals. This is the
-  classic threat-model boundary of a user-space trusted kernel.
+  classic threat-model boundary of any user-space policy kernel.
 - **Supply-chain compromise.** A malicious Rust crate, Python runtime or
   Ollama binary can undermine everything above. Mitigations: pinned
   versions, `cargo --locked` in CI, a sidecar with no third-party Python
@@ -183,6 +187,12 @@ They are documented here so no user is surprised.
 - **First-run key race.** Two `reli` processes that both find no HMAC
   key at the same moment may each create one; one log then never
   verifies (fail closed, but unusable).
+- **The HMAC key in memory.** While `reli` runs, the key is ordinary
+  process memory: the OS may page it to swap or a hibernation file, and a
+  crash dump may contain it.
+- **Look-alike letters.** Letters from other scripts that look like Latin
+  ones (Cyrillic "а" for "a") are accepted in file names; only control and
+  invisible characters are refused.
 - **Names that look alike but are not control characters.** Unicode
   normalization variants (NFC vs NFD) and, on Windows, names ending in a
   dot or a space are accepted as given.
@@ -197,9 +207,15 @@ They are documented here so no user is surprised.
 - Physical attacks (cold-boot, DMA, evil-maid, TPM bypass if no TPM is
   configured).
 - Malicious behaviour inside the user's own legitimate process tree.
-- Non-audited Ollama or model versions. Each release pins an Ollama
-  version it was tested against; newer versions ship at the user's risk
-  until re-audited.
+- Non-audited Ollama or model versions. Each release names the Ollama
+  versions whose network behaviour was audited (`audits/`); the sidecar
+  warns on any other version, which runs at the user's risk until
+  re-audited.
+- Ollama's own outbound traffic. With default settings the audited
+  version contacts `ollama.com` (model recommendations, cloud catalogue);
+  `OLLAMA_NO_CLOUD=1` or a firewall rule stops it
+  ([`audits/ollama_v0.31.2.md`](../audits/ollama_v0.31.2.md)). ReliAgent
+  does not start or configure Ollama.
 - Bugs in CPython, Rust stdlib, or `rusqlite` / `cap-std` / `hmac` /
   `sha2`. These are treated as trusted computing base.
 
@@ -208,7 +224,7 @@ They are documented here so no user is surprised.
 ## 6. Change control
 
 - This file is part of the repository and versioned alongside the code.
-- Any PR that weakens a guarantee here must update this file in the same
+- Any PR that weakens a claim here must update this file in the same
   commit, with rationale.
 - New rows are written with `hash_format_version = 2`; version `1` rows
   remain verifiable. Any change to the fields covered by HMAC or the
@@ -223,4 +239,5 @@ They are documented here so no user is surprised.
   and its HMAC.
 - [`../SECURITY.md`](../SECURITY.md) — how to report a vulnerability.
 - [`../KNOWN_ISSUES.md`](../KNOWN_ISSUES.md) — platform-specific caveats.
-- `tests/red_team.rs` — the executable version of §3.
+- `tests/red_team.rs` — the path and content vectors of §3 as tests (the
+  audit-log and approval vectors are tested next to their code).

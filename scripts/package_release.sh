@@ -133,8 +133,10 @@ write(info / "RECORD", "\n".join(rows) + "\n")
 PYEOF
 
 cp "${ROOT}/README.md" "${ROOT}/LICENSE" "${ROOT}/SECURITY.md" \
-   "${ROOT}/KNOWN_ISSUES.md" "${ROOT}/MODEL_SHA256.txt" "${OUT}/"
+   "${ROOT}/KNOWN_ISSUES.md" "${ROOT}/CHANGELOG.md" "${ROOT}/MODEL_SHA256.txt" "${OUT}/"
 copy_tracked docs "${OUT}/docs"
+# The README sends users to the Ollama audit (how to run Ollama offline).
+copy_tracked audits "${OUT}/audits"
 
 # Owner keeps rwX, nobody else may write (tar, cp and the PBS archive may
 # have carried other modes). No-op on Windows file systems.

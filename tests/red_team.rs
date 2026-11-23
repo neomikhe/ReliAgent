@@ -4,7 +4,7 @@
 //! LLM critic. The invariant under test is: "the kernel refuses this, and
 //! the refusal is encoded in a typed error the audit log can record."
 //!
-//! Vectors are numbered to match `PROJECT_CONTEXT.md` section 16. Tests for
+//! Vectors are numbered `vNN`; a new one takes the next free number. Tests for
 //! features not yet implemented in v0.1 are marked `#[ignore]` with a TODO
 //! and the version where they will land, so `cargo test` stays green while
 //! the gap remains visible.

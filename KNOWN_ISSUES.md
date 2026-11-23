@@ -25,14 +25,17 @@ will show a blue "Windows protected your PC" dialog on first run.
   cosign verify-blob \
       --certificate reli-v0.1.0-windows-x86_64.zip.cert \
       --signature   reli-v0.1.0-windows-x86_64.zip.sig \
-      --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0" \
+      --certificate-identity "https://github.com/neomikhe/ReliAgent/.github/workflows/release.yml@refs/tags/v0.1.0" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       reli-v0.1.0-windows-x86_64.zip
-  gh attestation verify reli-v0.1.0-windows-x86_64.zip --repo <owner>/<repo>
+  gh attestation verify reli-v0.1.0-windows-x86_64.zip --repo neomikhe/ReliAgent \
+      --signer-workflow neomikhe/ReliAgent/.github/workflows/release.yml
   ```
 - **Trust model:** a SmartScreen bypass is not the same as trusting the
-  binary. Always pass the exact `--certificate-identity`: without it,
-  cosign would accept a signature from *any* GitHub workflow.
+  binary. Always pass the exact `--certificate-identity` above (never a
+  loose `--certificate-identity-regexp`) and `--signer-workflow`: a looser
+  check would accept a signature or attestation from another workflow or
+  repository.
 
 ### Antivirus touching the sandbox
 
@@ -90,11 +93,20 @@ in v0.1.0.
 The first command that opens the audit log triggers a Keychain access
 prompt ("reli wants to use the keychain"). This is expected; grant
 "Always Allow" to avoid prompts on every action. The keychain entry is
-named `reliagent` / `audit-hmac-v1`.
+named `reliagent` / `audit-hmac-v1`; each audit log also has a head
+witness entry `reliagent` / `audit-head-v1:<16 hex chars>`.
 
 ---
 
 ## Linux
+
+### The release binary is built on Ubuntu 24.04
+
+The Linux archive is built on an Ubuntu 24.04 runner and links the
+system glibc dynamically, so it needs a distribution with a glibc at
+least as recent as the symbols it uses (current Debian, Ubuntu 24.04,
+Fedora and Arch are fine). If `./reli` fails with
+`version 'GLIBC_2.xx' not found`, build from source instead.
 
 ### The keyring needs D-Bus and a Secret Service daemon
 
@@ -151,7 +163,8 @@ network file systems (SMB, NFS).
 When verification fails, `reli` names the first bad entry and from then
 on every command that opens the log refuses to run (exit code `3`):
 `run`, `write`, `read`, `ls`, `verify` and `sandbox status`. Nothing is
-repaired automatically and there is no `--force`. What still works:
+repaired automatically and no flag overrides it (`reset --force` only
+skips the `WIPE` prompt). What still works:
 
 - `reli log > export.jsonl` prints every entry exactly as stored (also
   the tampered ones) and then says on stderr where verification fails.
@@ -214,10 +227,12 @@ updated twice per action. A log that is shorter than its witness — tail
 rows deleted, or `audit.db` deleted or replaced — fails verification
 (exit code `3`).
 
-- **Deleting `~/.reliagent/` by hand now looks like tampering.** Use
+- **Deleting `~/.reliagent/` by hand looks like tampering.** Use
   `reli reset --wipe-everything`, which also removes the witness.
-- Using several `--audit-dir` values creates one witness per directory;
-  `reli reset` with the same `--audit-dir` removes it.
+- Several `--audit-dir` values get one witness each, but all logs share
+  one HMAC key. `reli reset --wipe-everything` deletes that key, so every
+  *other* audit log stops verifying (exit `3`). Export them with
+  `reli log` first.
 - Restoring an old backup of `~/.reliagent/` fails verification for the
   same reason. Restore it only together with `reli reset`, or after
   removing that log's witness entry from the keyring.
@@ -242,7 +257,7 @@ few milliseconds per action on an SSD, more on slow disks.
 When stdout is a terminal, `reli read` escapes control characters (escape
 sequences, `\r`, …) and replaces invalid UTF-8, because the file may have
 been written by the model. Newlines and tabs are kept. Pipe or redirect
-the output (`reli read a.bin > a.bin`) to get the exact bytes. `reli log`
+the output (`reli read a.bin > ~/a-copy.bin`) to get the exact bytes. `reli log`
 always writes control and invisible characters as JSON escapes, on a
 terminal or not (the log may have been tampered with), so its output is
 valid JSON Lines that is safe to `cat`, `grep` or `jq` later.
@@ -255,8 +270,9 @@ zero-width characters and joiners, the soft hyphen, Hangul fillers,
 variation selectors, invisible "tag" characters (U+E0000 block, which a
 model reads but a human does not see), a BOM or Unicode line separators —
 are rejected for every tool (`invalid path`). The agent can neither
-create nor read such a file, and a name can never look different in the
-approval prompt from what it is. Rename files like that by hand if you
+create nor read such a file, and no character of a name can be hidden
+from the approver. Look-alike letters from other scripts (Cyrillic "а"
+for Latin "a") are still accepted. Rename files like that by hand if you
 need `reli` to reach them.
 
 Ordinary Unicode (accents, CJK, most emoji) is fine. The cost: names that
@@ -394,13 +410,26 @@ On a machine without a supported GPU, one `reli run` (agent + LLM critic,
 two inferences) takes about a minute with the 7B model. This is Ollama's
 inference speed, not ReliAgent overhead.
 
-### Ollama telemetry
+### Ollama contacts ollama.com unless you turn it off
 
-Ollama has historically contacted `ollama.com` for version checks. We
-verify this on the version we target and record the audit in
-`audits/ollama_vX.Y.Z.md`. **Newer Ollama versions ship at your own risk
-until we re-audit.** If you are privacy-sensitive, pin the audited
-version.
+ReliAgent never touches the network, but Ollama does on its own. The
+audit of the targeted version
+([`audits/ollama_v0.31.2.md`](audits/ollama_v0.31.2.md)) found that
+`ollama serve` 0.31.2 fetches a list of model recommendations and the
+catalogue of cloud models from `ollama.com` at start-up, and the
+recommendations again every few hours. No prompt, output or file name is
+sent, but ollama.com learns that an Ollama server runs at your address.
+
+- **Start Ollama with `OLLAMA_NO_CLOUD=1`** (for the desktop app, set it
+  as a user environment variable and restart the app). With it, the
+  audit saw no outbound connection at all, and `reli run` works the same.
+- For a stronger control, block Ollama's outbound traffic in your firewall and
+  allow it only while you run `ollama pull`.
+- The desktop app's own update checks were not audited.
+
+`reli run` warns when the Ollama it talks to is not an audited version.
+Newer versions work, but their network behaviour has not been checked
+until a new audit lands in [`audits/`](audits/).
 
 ### No outbound network from `reli` itself
 
@@ -430,7 +459,7 @@ so users do not mistake them for regressions.
 | `args_hash` does not depend on how a proposal is spelled, but its bytes are not byte-exact RFC 8785 (JCS): `write_file` signs `path` before `bytes` (see [HASH_FORMAT.md §3](docs/HASH_FORMAT.md)). | Next hash format version |
 | No configuration file: everything is a flag or an environment variable (`--sandbox`, `--audit-dir`, `--python`, `RELI_PYTHON`). | v0.2+ |
 | No keyring fallback on Linux without a Secret Service (`reli` refuses to run). | Open question |
-| No Tauri GUI. CLI only. | v0.2+ |
+| No Tauri GUI. CLI only. | v0.2 or later |
 | No code-execution tool (`execute_code`). | v0.3 (WASI-Python / RustPython) |
 | No HTTP tool (`http_get`) with domain allowlist. | v0.2 |
 | Windows code-signing certificate. | v0.2 |

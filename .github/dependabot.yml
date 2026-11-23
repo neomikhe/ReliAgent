@@ -1,0 +1,30 @@
+# Dependabot: weekly update PRs for the Rust crates, the Python sidecar's
+# lock file and the pinned GitHub Actions. Each PR runs .github/workflows/
+# test.yml. `cooldown` follows the project's rule of only adopting
+# releases that are at least two weeks old.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: uv
+    directory: /python-core
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5

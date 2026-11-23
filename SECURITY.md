@@ -14,7 +14,7 @@ branch and are cut as point releases. We do not backport to prior tags.
 |---|---|
 | `main` (unreleased) | Yes |
 | `v0.1.x` | Yes (current) |
-| `v0.0.x` | No — development milestones, superseded by `v0.1.0` |
+| Older commits | No — pre-release development history |
 
 Once we exit Research Preview, this table will be replaced with a proper
 per-version support window.
@@ -35,8 +35,9 @@ Anything that weakens a claim in
   approval.
 - Any outbound network traffic from the `reli` Rust binary, or from the
   Python sidecar to any host other than `127.0.0.1:11434`.
-- Any disclosure of the HMAC key outside the OS keyring (logs, error
-  messages, swap files, crash dumps).
+- Any disclosure of the HMAC key by `reli` itself (a file, a log, an
+  error message, the audit log). The key in process memory reaching swap
+  or a crash dump is a known limitation (THREAT_MODEL.md §4).
 
 Issues that are explicitly **not** security issues (see THREAT_MODEL.md
 §5):
@@ -45,32 +46,32 @@ Issues that are explicitly **not** security issues (see THREAT_MODEL.md
 - Problems caused by a process already running as the user (ptrace,
   memory dump, binary replacement on disk).
 - Physical attacks (cold boot, DMA, evil-maid).
-- Weaknesses introduced by dependencies whose audited version we ship
-  with; please report those upstream and we will track the fix.
+- Weaknesses in a dependency at the pinned version we ship; please
+  report those upstream and we will track the fix.
 
 If you are unsure which side of the line a finding falls on, err on the
 side of reporting it privately — we'll figure it out together.
 
 ## How to report
 
-**Preferred:** GitHub Security Advisories.
+Use GitHub's private vulnerability reporting — it is the only channel:
 
-1. Go to the repository's **Security** tab.
-2. Click **Report a vulnerability**.
-3. Fill out the advisory form.
+1. Open <https://github.com/neomikhe/ReliAgent/security/advisories/new>
+   (or the repository's **Security** tab → **Report a vulnerability**).
+2. Fill out the advisory form.
 
-This gives us a private channel, a CVE workflow if one becomes relevant,
-and a clean audit trail.
-
-**Alternative:** Email `security@<project-domain>` (address added to the
-repo before the first public release tag).
+Only the maintainers can see the report. It gives us a private place to
+discuss and fix it, a CVE workflow if one becomes relevant, and a clean
+audit trail. There is no security email address.
 
 Please include:
 
 - A minimal reproducer. A failing red-team-style Rust test is ideal;
   shell commands or a short repro binary is fine.
 - The commit SHA you reproduced against.
-- Your platform (`reli --version`, `uname -a` or `systeminfo`).
+- Your platform (`reli --version`, plus `uname -sr` or `ver`). Please do
+  not paste full `systeminfo` output: it includes host names and network
+  addresses.
 - Whether you believe a patch is urgent (active exploitation in the wild)
   or a defence-in-depth hardening.
 
@@ -81,6 +82,9 @@ Please do **not**:
 - Disclose third-party data obtained while reproducing.
 
 ## Our commitment
+
+ReliAgent is maintained by one person during the Research Preview, so
+these are targets we aim for, not guarantees:
 
 - **Acknowledgement within 72 hours** of a report reaching us.
 - **Triage within 7 days**: is it a vulnerability, is it a duplicate, what
@@ -94,11 +98,12 @@ Please do **not**:
 - No gag orders, no "please take it down" requests. The bar is a fix
   ships first, then you are free to publish.
 
-## PGP key
+## Encryption
 
-For extremely sensitive reports, we will publish a PGP public key as part
-of the first public release. Until that key is posted here, use GitHub
-Security Advisories (end-to-end encrypted by GitHub on your behalf).
+We do not publish a PGP key. A private vulnerability report is visible
+only to you and the maintainers, but it is stored by GitHub, not
+end-to-end encrypted. If a detail is too sensitive even for that, say so
+in the report and we will agree on a different way to share it.
 
 ## Scope clarification
 

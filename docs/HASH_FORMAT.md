@@ -296,6 +296,8 @@ def verify(db_path, key: bytes) -> None:
     # Read-only, and only while reli is not running (it holds an
     # exclusive lock). Compare the head witness and anchors/ separately.
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # Minimal check only: §5.6 is the full, byte-exact allow-list of the
+    # schema (a disguised type such as 'TRIGGER' passes this query).
     foreign = conn.execute(
         "SELECT type, name FROM sqlite_master WHERE type IN ('trigger','view')"
     ).fetchall()

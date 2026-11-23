@@ -13,12 +13,13 @@ dev = [
     "pytest>=8.0",
 ]
 
+# Backend de uv con un rango que cubre los uv usados (local y CI): uv usa
+# entonces su backend integrado y `uv sync` no descarga nada sin fijar para
+# construir el paquete (uv.lock no cubre las dependencias de construcción).
+# El módulo es src/reliagent_python (disposición por defecto de uv_build).
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/reliagent_python"]
+requires = ["uv_build>=0.11.7,<0.14"]
+build-backend = "uv_build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

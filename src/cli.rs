@@ -33,7 +33,7 @@ const EXIT_BUSY: i32 = 6;
 #[command(
     name = "reli",
     version,
-    about = "ReliAgent Trust Kernel (v0.1.0 Research Preview — kernel + audit + orquestador + aprobación TTY)"
+    about = "ReliAgent: kernel de políticas y auditoría para agentes de IA locales (v0.1.0 Research Preview)"
 )]
 struct Cli {
     /// Ruta raíz del sandbox. Por defecto: ~/ReliAgent_Sandbox

@@ -1,0 +1,66 @@
+# Build output
+/target/
+/dist/
+/out/
+# python-build-standalone download cache (scripts/fetch_pbs.sh)
+/vendor/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+*.egg-info/
+# The tracked pin is python-core/.python-version.
+/.python-version
+
+# Local state of reli itself: never commit an audit log, its keys, an
+# export (`reli log > x.jsonl` holds paths and times) or a sandbox
+.reliagent/
+ReliAgent_Sandbox/
+anchors/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.jsonl
+*.bak
+
+# Logs (including Ollama audit logs, which contain local paths) and dumps
+*.log
+*.dmp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Model weights (Ollama keeps them outside the repository)
+*.gguf
+*.safetensors
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# The maintainer's private notes and local AI-assistant / MCP settings
+# (an .mcp.json can hold tokens)
+PROJECT_CONTEXT.md
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+.playwright-mcp/
