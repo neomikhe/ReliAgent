@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 #[derive(Debug, Serialize)]
 pub struct RpcRequest {
@@ -24,14 +25,17 @@ impl RpcRequest {
     }
 }
 
+/// Respuesta tal como llega. `id`, `result` y `data` se quedan como texto
+/// JSON validado (`RawValue`): el bridge no construye un árbol `Value` de un
+/// tamaño que decida el sidecar; cada consumidor lee solo lo que necesita.
 #[derive(Debug, Deserialize)]
 pub struct RpcResponse {
     #[allow(dead_code)]
     pub jsonrpc: Option<String>,
-    #[allow(dead_code)]
-    pub id: Option<Value>,
     #[serde(default)]
-    pub result: Option<Value>,
+    pub id: Option<Box<RawValue>>,
+    #[serde(default)]
+    pub result: Option<Box<RawValue>>,
     #[serde(default)]
     pub error: Option<RpcError>,
 }
@@ -41,7 +45,20 @@ pub struct RpcError {
     pub code: i64,
     pub message: String,
     #[serde(default)]
-    pub data: Option<Value>,
+    pub data: Option<Box<RawValue>>,
+}
+
+impl RpcResponse {
+    /// `true` si la respuesta corresponde a la petición `id`. Un error con
+    /// `id: null` (el sidecar no pudo leer la petición) también es la
+    /// respuesta a esa petición: el protocolo es una línea por petición.
+    pub fn answers(&self, id: u64) -> bool {
+        match self.id.as_deref().map(RawValue::get) {
+            Some(got) if got == id.to_string() => true,
+            Some("null") | None => self.error.is_some(),
+            Some(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -62,8 +79,19 @@ mod tests {
         let raw = r#"{"jsonrpc":"2.0","id":1,"result":{"pong":true}}"#;
         let resp: RpcResponse = serde_json::from_str(raw).unwrap();
         assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["pong"], serde_json::json!(true));
+        assert!(resp.answers(1));
+        assert_eq!(resp.result.unwrap().get(), r#"{"pong":true}"#);
+    }
+
+    #[test]
+    fn answers_checks_the_id() {
+        let decode = |raw: &str| serde_json::from_str::<RpcResponse>(raw).unwrap();
+        assert!(!decode(r#"{"id":2,"result":{}}"#).answers(1));
+        assert!(!decode(r#"{"id":"1","result":{}}"#).answers(1));
+        assert!(!decode(r#"{"id":null,"result":{}}"#).answers(1));
+        assert!(!decode(r#"{"result":{}}"#).answers(1));
+        assert!(decode(r#"{"id":null,"error":{"code":-32700,"message":"x"}}"#).answers(1));
+        assert!(!decode(r#"{"id":7,"error":{"code":-32601,"message":"x"}}"#).answers(1));
     }
 
     #[test]

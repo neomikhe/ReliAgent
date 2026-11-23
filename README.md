@@ -78,7 +78,7 @@ not that.
 | Python sidecar (orchestrator + critic + Ollama client) | Implemented. Stdlib-only, no runtime dependencies. Tested against a local fake Ollama server; verified manually against Ollama 0.31.2. |
 | Model pinning (`qwen2.5:7b-instruct-q4_K_M`) | Weights SHA-256 pinned and re-checked on every `reli run`. |
 | Red-team suite (25 vectors from threat model §16) | Implemented in [`tests/red_team.rs`](tests/red_team.rs). |
-| `python-build-standalone` self-contained release | Scaffolded, not yet a one-shot installer. |
+| Self-contained release (binary + pinned python-build-standalone runtime + sidecar) | Implemented: `scripts/package_release.sh`, built and smoke-tested per platform by the release workflow. |
 | Tauri GUI | Not in v0.1. Planned for v0.2. |
 | `grant_scope` / read allowlist / session quotas | Planned for v0.2. |
 | `execute_code` (WASI / RustPython) | Planned for v0.3. |
@@ -87,19 +87,49 @@ See [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md) for platform-specific caveats.
 
 ---
 
-## Install (from source)
+## Install
 
-Requirements:
+Both ways need an [Ollama](https://ollama.com/) install listening on
+`127.0.0.1:11434` with the canonical model pulled, for actual LLM use
+(tests and `--mock-llm` run without it):
 
-- Rust **1.85.0** (pinned in [`rust-toolchain.toml`](rust-toolchain.toml))
-- Python **3.12** with [`uv`](https://github.com/astral-sh/uv)
-- An [Ollama](https://ollama.com/) install listening on `127.0.0.1:11434`
-  with the canonical model pulled (for actual LLM use; tests and
-  `--mock-llm` run without it):
+```bash
+ollama pull qwen2.5:7b-instruct-q4_K_M   # ~4.7 GB
+```
 
-  ```bash
-  ollama pull qwen2.5:7b-instruct-q4_K_M   # ~4.7 GB
-  ```
+### From a release
+
+Each release archive is self-contained: the `reli` binary, a pinned
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone)
+runtime in `python/` (SHA-256 in [`scripts/pbs.lock`](scripts/pbs.lock))
+with the sidecar installed, and the docs. No system Python is needed.
+
+```bash
+# Verify the archive first; the release notes give the exact identity.
+cosign verify-blob --certificate <archive>.cert --signature <archive>.sig \
+    --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com <archive>
+gh attestation verify <archive> --repo <owner>/<repo>
+
+tar -xzf reli-v0.1.0-linux-x86_64.tar.gz      # or unzip the Windows .zip
+cd reli-v0.1.0-linux-x86_64
+./reli ping                                    # finds ./python by itself
+```
+
+Keep `python/` next to `reli` (that is where `reli` looks for it), and
+extract as the user who will run it into a directory only that user can
+write: `reli` trusts that folder (see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+On Linux, `reli` needs `libdbus-1.so.3` and a running Secret Service
+(gnome-keyring, KeePassXC, KWallet) for the OS keyring; desktop
+distributions have both, minimal containers may not.
+
+### From source
+
+Requirements: Rust **1.85.0** (pinned in
+[`rust-toolchain.toml`](rust-toolchain.toml)) and Python **3.12** with
+[`uv`](https://github.com/astral-sh/uv). On Linux, also the D-Bus headers
+and `pkg-config` (`sudo apt-get install libdbus-1-dev pkg-config` on
+Debian/Ubuntu, `dbus-devel pkgconf` on Fedora).
 
 ```bash
 git clone https://github.com/<org>/reliagent
@@ -108,22 +138,32 @@ cd reliagent
 # Rust side
 cargo build --release
 
-# Python sidecar
-cd python-core
-uv sync
-uv pip install -e .
-cd ..
+# Python sidecar: `uv sync` creates python-core/.venv with the package installed
+(cd python-core && uv sync --extra dev)
+
+# Tell reli which interpreter runs the sidecar
+export RELI_PYTHON="$PWD/python-core/.venv/bin/python"      # Windows: python-core\.venv\Scripts\python.exe
 
 # Smoke tests
 cargo test
-cd python-core && uv run pytest && cd ..
+(cd python-core && uv run pytest)
+./target/release/reli ping
 ```
 
-The release binary lands at `target/release/reli`.
+`reli` looks for the sidecar interpreter in this order: `--python <path>`,
+`$RELI_PYTHON`, `python/` next to the `reli` executable (release layout),
+then `python3` (`python` on Windows) from `PATH`. It starts it in isolated
+mode (`python -I`), so that interpreter must have `reliagent_python`
+installed. To build a release-style directory locally, see
+[`scripts/README.md`](scripts/README.md).
 
 ---
 
 ## First run
+
+The examples use a source build (`./target/release/reli`, with
+`RELI_PYTHON` set as above); from a release, run `./reli` inside the
+extracted folder instead.
 
 ```bash
 # Inspect where things will go (does not create anything yet).
@@ -230,7 +270,7 @@ reliagent/
 ├── docs/
 │   ├── THREAT_MODEL.md
 │   └── HASH_FORMAT.md
-├── scripts/                # python-build-standalone fetch scaffolding
+├── scripts/                # release packaging (pinned Python runtime)
 └── .github/workflows/      # release signing (cosign + SBOM)
 ```
 

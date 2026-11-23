@@ -51,12 +51,19 @@ vectors, platform weirdness, missed edge cases in the policy engine.
 cargo --version
 rustc --version
 
-# Python toolchain uses uv + Python 3.12
-cd python-core
-uv sync
-uv pip install -e '.[dev]'
-cd ..
+# Linux only: the keyring's Secret Service backend links libdbus
+sudo apt-get install libdbus-1-dev pkg-config   # Fedora: dbus-devel pkgconf
+
+# Python toolchain uses uv + Python 3.12; this installs the package
+# (editable) and pytest into python-core/.venv
+(cd python-core && uv sync --extra dev)
+
+# Run reli against that venv
+export RELI_PYTHON="$PWD/python-core/.venv/bin/python"   # Windows: .../.venv/Scripts/python.exe
 ```
+
+To build and smoke-test a release-style bundle (binary + pinned Python
+runtime + sidecar), see [`scripts/README.md`](scripts/README.md).
 
 Run the full local check matrix before pushing:
 

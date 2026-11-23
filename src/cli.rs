@@ -43,11 +43,13 @@ struct Cli {
     #[arg(long, global = true)]
     audit_dir: Option<PathBuf>,
 
-    /// Intérprete Python para el sidecar. Por defecto: python
+    /// Intérprete Python para el sidecar (con `reliagent_python` instalado).
+    /// Por defecto: $RELI_PYTHON, el incluido en el release junto a `reli`,
+    /// o python3/python del PATH.
     #[arg(long, global = true)]
     python: Option<PathBuf>,
 
-    /// Directorio de trabajo del sidecar Python. Por defecto: ./python-core
+    /// Directorio de trabajo del sidecar Python. Por defecto: el de `reli`.
     #[arg(long, global = true)]
     python_cwd: Option<PathBuf>,
 
@@ -154,10 +156,273 @@ fn default_audit_dir() -> PathBuf {
     default_home().join(".reliagent")
 }
 
-fn default_python_cwd() -> PathBuf {
-    std::env::current_dir()
-        .map(|c| c.join("python-core"))
-        .unwrap_or_else(|_| PathBuf::from("python-core"))
+/// Ruta lista para mostrar: saneada y sin el prefijo `\\?\` que añade
+/// `canonicalize` en Windows (salvo en rutas UNC, donde forma parte de ella).
+/// Solo afecta a lo que se imprime, nunca a la ruta que se usa.
+fn shown_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    let plain = match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+        _ => text,
+    };
+    sanitize_for_terminal(&plain)
+}
+
+/// Directorio real del ejecutable `reli` (en un release, junto a `python/`).
+/// Se resuelven los enlaces simbólicos: en macOS `current_exe` puede
+/// devolver la ruta del enlace (p. ej. en /usr/local/bin).
+fn exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let real = std::fs::canonicalize(&exe).unwrap_or(exe);
+    real.parent().map(Path::to_path_buf)
+}
+
+/// Dónde estaría el intérprete de python-build-standalone incluido en el
+/// release (`scripts/package_release.sh`).
+fn bundled_python(exe_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        exe_dir.join("python").join("python.exe")
+    } else {
+        exe_dir.join("python").join("bin").join("python3")
+    }
+}
+
+/// De dónde salió el intérprete del sidecar (se muestra al usuario).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonSource {
+    Flag,
+    Env,
+    Bundled,
+    Path,
+}
+
+impl PythonSource {
+    fn label(self) -> &'static str {
+        match self {
+            PythonSource::Flag => "--python",
+            PythonSource::Env => "RELI_PYTHON",
+            PythonSource::Bundled => "incluido junto a reli",
+            PythonSource::Path => "PATH",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PythonChoice {
+    path: PathBuf,
+    source: PythonSource,
+    /// Por qué se descartó el intérprete incluido, si fue el caso.
+    warning: Option<String>,
+}
+
+/// Intérprete del sidecar, por orden: `--python`, `RELI_PYTHON`, el incluido
+/// junto al ejecutable (si `trust` lo acepta) y, por último, el del PATH. El
+/// sidecar se lanza con `-I`, así que el elegido tiene que tener
+/// `reliagent_python` instalado. Las rutas relativas se resuelven contra el
+/// cwd de quien llama (`cwd`), igual en todas las plataformas.
+fn resolve_python(
+    flag: Option<PathBuf>,
+    env: Option<std::ffi::OsString>,
+    exe_dir: Option<&Path>,
+    cwd: &Path,
+    trust: impl Fn(&Path) -> Result<(), String>,
+) -> PythonChoice {
+    let absolute = |p: PathBuf| {
+        // Un nombre sin separadores (p. ej. `python3.12`) se busca en el PATH.
+        if p.is_relative() && p.components().count() > 1 {
+            cwd.join(p)
+        } else {
+            p
+        }
+    };
+    let choice = |path, source| PythonChoice {
+        path,
+        source,
+        warning: None,
+    };
+    if let Some(p) = flag {
+        return choice(absolute(p), PythonSource::Flag);
+    }
+    if let Some(p) = env.filter(|v| !v.is_empty()) {
+        return choice(absolute(PathBuf::from(p)), PythonSource::Env);
+    }
+    let mut warning = None;
+    if let Some(dir) = exe_dir {
+        let bundled = bundled_python(dir);
+        if bundled.is_file() {
+            match trust(dir) {
+                Ok(()) => return choice(bundled, PythonSource::Bundled),
+                Err(why) => {
+                    warning = Some(format!(
+                        "se ignora el Python incluido en {}: {why}",
+                        dir.join("python").display()
+                    ))
+                }
+            }
+        }
+    }
+    PythonChoice {
+        path: PathBuf::from(if cfg!(windows) { "python" } else { "python3" }),
+        source: PythonSource::Path,
+        warning,
+    }
+}
+
+/// (ruta, uid, mode) de un elemento del Python incluido.
+#[cfg_attr(not(unix), allow(dead_code))]
+type TrustEntry = (PathBuf, u32, u32);
+
+/// Todos los `entries` deben ser del dueño de `reli` (o de root) y no
+/// escribibles por grupo u otros: si no, otra cuenta pudo dejar ahí un
+/// intérprete o un módulo que `reli` ejecutaría. El error nombra el elemento
+/// para que el usuario pueda corregirlo.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn check_owner_and_mode(entries: &[TrustEntry], owner: u32) -> Result<(), String> {
+    for (path, uid, mode) in entries {
+        if *uid != owner && *uid != 0 {
+            return Err(format!(
+                "{} is owned by uid {uid}, not by the owner of reli",
+                path.display()
+            ));
+        }
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{} is writable by group or others (mode {:o})",
+                path.display(),
+                mode & 0o777
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Comprueba el `python/` incluido antes de confiar en él, frente al dueño
+/// del ejecutable de `reli` (ver `bundle_entries`). En Windows las ACL no se
+/// comprueban: el directorio del release forma parte de la base de
+/// confianza (ver docs/THREAT_MODEL.md).
+#[cfg(unix)]
+fn check_bundle_trust(exe_dir: &Path) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let (_, owner, _) = unix_meta(&exe, true)?;
+    check_owner_and_mode(&bundle_entries(exe_dir)?, owner)
+}
+
+/// (ruta, uid, mode) de `p`, siguiendo o no un enlace simbólico final.
+#[cfg(unix)]
+fn unix_meta(p: &Path, follow: bool) -> Result<TrustEntry, String> {
+    use std::os::unix::fs::MetadataExt;
+    let m = if follow {
+        std::fs::metadata(p)
+    } else {
+        std::fs::symlink_metadata(p)
+    };
+    m.map(|m| (p.to_path_buf(), m.uid(), m.mode()))
+        .map_err(|e| format!("{}: {e}", p.display()))
+}
+
+/// Lo que se comprueba del Python incluido: la cadena de directorios hasta
+/// el intérprete, todos los directorios de `lib/python3.*` (site-packages
+/// incluido), el intérprete real (enlaces resueltos) y todo el paquete
+/// `reliagent_python`. Los archivos de la biblioteca estándar no se miran
+/// uno a uno (son miles); sus directorios sí, así que nadie más puede
+/// añadir ni sustituir módulos.
+#[cfg(unix)]
+fn bundle_entries(exe_dir: &Path) -> Result<Vec<TrustEntry>, String> {
+    let python_dir = exe_dir.join("python");
+    let lib = python_dir.join("lib");
+    let interpreter = std::fs::canonicalize(bundled_python(exe_dir))
+        .map_err(|e| format!("{}: {e}", bundled_python(exe_dir).display()))?;
+    let mut entries = Vec::new();
+    for dir in [&python_dir, &python_dir.join("bin"), &lib] {
+        entries.push(unix_meta(dir, false)?);
+    }
+    entries.push(unix_meta(&interpreter, true)?);
+    let mut found = false;
+    for stdlib in python_version_dirs(&lib)? {
+        // Todos los directorios (site-packages incluido), sin los archivos.
+        dir_tree_entries(&stdlib, &mut entries)?;
+        let package = stdlib.join("site-packages").join("reliagent_python");
+        if package.exists() {
+            tree_entries(&package, &mut entries)?;
+            found = true;
+        }
+    }
+    if !found {
+        return Err(format!(
+            "reliagent_python is not installed under {}",
+            lib.display()
+        ));
+    }
+    Ok(entries)
+}
+
+/// Los `lib/python3.*` del runtime (normalmente uno).
+#[cfg(unix)]
+fn python_version_dirs(lib: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(lib).map_err(|e| format!("{}: {e}", lib.display()))?;
+    Ok(entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("python3."))
+        })
+        .collect())
+}
+
+/// (uid, mode) de `dir` y de todos sus subdirectorios; los archivos no se
+/// examinan (el tipo sale de la entrada del directorio, sin `stat`).
+#[cfg(unix)]
+fn dir_tree_entries(dir: &Path, out: &mut Vec<TrustEntry>) -> Result<(), String> {
+    out.push(unix_meta(dir, false)?);
+    let fail = |e: std::io::Error| format!("{}: {e}", dir.display());
+    for child in std::fs::read_dir(dir).map_err(fail)? {
+        let child = child.map_err(fail)?;
+        if child.file_type().map_err(fail)?.is_dir() {
+            dir_tree_entries(&child.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+/// (uid, mode) de `root` y de todo lo que contiene. Un enlace simbólico
+/// dentro del paquete es un error: podría apuntar fuera de lo comprobado.
+#[cfg(unix)]
+fn tree_entries(root: &Path, out: &mut Vec<TrustEntry>) -> Result<(), String> {
+    let kind = std::fs::symlink_metadata(root)
+        .map_err(|e| format!("{}: {e}", root.display()))?
+        .file_type();
+    if kind.is_symlink() {
+        return Err(format!(
+            "{}: symbolic link inside the bundled sidecar",
+            root.display()
+        ));
+    }
+    out.push(unix_meta(root, false)?);
+    if kind.is_dir() {
+        let children = std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
+        for child in children {
+            let child = child.map_err(|e| format!("{}: {e}", root.display()))?;
+            tree_entries(&child.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_bundle_trust(_exe_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Directorio de trabajo del sidecar. Con `-I` no afecta a las
+/// importaciones; solo tiene que existir.
+fn default_sidecar_cwd(exe_dir: Option<&Path>) -> PathBuf {
+    exe_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
@@ -218,8 +483,18 @@ pub fn run() -> i32 {
     let cli = Cli::parse();
     let sandbox_path = cli.sandbox.unwrap_or_else(default_sandbox_path);
     let audit_dir = cli.audit_dir.unwrap_or_else(default_audit_dir);
-    let python = cli.python.unwrap_or_else(|| PathBuf::from("python"));
-    let python_cwd = cli.python_cwd.unwrap_or_else(default_python_cwd);
+    let exe_dir = exe_dir();
+    let caller_cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let python = resolve_python(
+        cli.python,
+        std::env::var_os("RELI_PYTHON"),
+        exe_dir.as_deref(),
+        &caller_cwd,
+        check_bundle_trust,
+    );
+    let python_cwd = cli
+        .python_cwd
+        .unwrap_or_else(|| default_sidecar_cwd(exe_dir.as_deref()));
     let non_interactive = cli.non_interactive;
 
     match cli.command {
@@ -279,22 +554,40 @@ pub fn run() -> i32 {
     }
 }
 
-fn spawn_bridge(python: &Path, python_cwd: &Path) -> Result<Bridge, i32> {
+fn spawn_bridge(python: &PythonChoice, python_cwd: &Path) -> Result<Bridge, i32> {
+    if let Some(warning) = &python.warning {
+        eprintln!("[reli] aviso: {}", sanitize_for_terminal(warning));
+    }
+    // Qué intérprete corre el sidecar, y por qué: p. ej. un RELI_PYTHON
+    // olvidado gana al Python incluido en el release.
+    eprintln!(
+        "[reli] sidecar: {} ({})",
+        shown_path(&python.path),
+        python.source.label()
+    );
+    let python = &python.path;
     let spec = SidecarSpec::Module {
         python: python.to_path_buf(),
     };
     Bridge::spawn(spec, python_cwd).map_err(|e| {
-        eprintln!("[reli] no se pudo lanzar el sidecar Python: {e}");
         eprintln!(
-            "[reli] sugerencia: verifique que `{}` esté en PATH y que `{}` contenga el paquete `reliagent_python`.",
-            python.display(),
-            python_cwd.display()
+            "[reli] no se pudo lanzar el sidecar Python ({}): {}",
+            shown_path(python),
+            error_text(&e)
         );
+        eprintln!("{}", SIDECAR_SETUP_HINT);
         EXIT_BRIDGE
     })
 }
 
-fn run_ping(python: &Path, python_cwd: &Path) -> i32 {
+/// Cómo dar a `reli` un intérprete con el sidecar instalado.
+const SIDECAR_SETUP_HINT: &str = "[reli] el sidecar necesita un Python 3.12+ con el paquete `reliagent_python` instalado:\n\
+     [reli]   - release: usa el `python/` incluido junto a `reli` (no lo muevas por separado);\n\
+     [reli]   - desde el código: `uv sync` en python-core/ y luego\n\
+     [reli]     RELI_PYTHON=python-core/.venv/bin/python (Windows: python-core\\.venv\\Scripts\\python.exe)\n\
+     [reli]     o `--python <ruta>`.";
+
+fn run_ping(python: &PythonChoice, python_cwd: &Path) -> i32 {
     let mut bridge = match spawn_bridge(python, python_cwd) {
         Ok(b) => b,
         Err(code) => return code,
@@ -307,6 +600,9 @@ fn run_ping(python: &Path, python_cwd: &Path) -> i32 {
         }
         Err(e) => {
             eprintln!("[reli] ping falló: {}", error_text(&e));
+            if let Some(hint) = sidecar_hint(&e) {
+                eprintln!("{hint}");
+            }
             EXIT_BRIDGE
         }
     }
@@ -344,7 +640,7 @@ fn escape_unsafe_chars(s: &str, keep: &[char]) -> String {
 }
 
 fn error_text(e: &KernelError) -> String {
-    sanitize_for_terminal(&e.to_string())
+    shown(&e.to_string(), &[])
 }
 
 fn llm_backend(mock_llm: bool) -> LlmBackend {
@@ -357,6 +653,11 @@ fn llm_backend(mock_llm: bool) -> LlmBackend {
 
 /// Instrucciones para el usuario según el error de aplicación del sidecar.
 fn sidecar_hint(err: &KernelError) -> Option<String> {
+    // El hijo murió antes de responder: casi siempre, un intérprete sin
+    // `reliagent_python` (con -I no lo busca en el directorio actual).
+    if matches!(err, KernelError::Bridge(m) if m.contains("closed stdout")) {
+        return Some(SIDECAR_SETUP_HINT.to_string());
+    }
     let KernelError::SidecarRpc { code, data, .. } = err else {
         return None;
     };
@@ -406,7 +707,7 @@ fn is_safe_model_tag(tag: &str) -> bool {
 fn run_agent(
     sandbox_path: &Path,
     audit_dir: &Path,
-    python: &Path,
+    python: &PythonChoice,
     python_cwd: &Path,
     prompt: &str,
     dry_run: bool,
@@ -459,44 +760,73 @@ fn run_agent(
 
     // La propuesta queda registrada como `pending` antes de pedir la
     // aprobación final por TTY (o rechazarla en modo non-interactive).
-    let summary = render_proposal_summary(proposal, &result);
+    let summary = render_proposal_summary(&action, &result.verdict, &result.critic_stage);
     let mode = approval_mode(non_interactive);
     run_action(sandbox_path, audit_dir, &action, || {
         approval::request_approval(&summary, mode)
     })
 }
 
-/// Líneas a mostrar del resultado del agente, ya saneadas.
-fn agent_result_lines(result: &AgentRunResult) -> Vec<String> {
-    let mut lines = vec![format!("[reli] agente: verdict={}", result.verdict)];
-    if !result.critic_stage.is_empty() {
-        lines.push(format!("[reli] crítico: stage={}", result.critic_stage));
+/// Máximo de caracteres de texto del agente que se muestra por línea: lo que
+/// devuelva el modelo (o quien suplante a Ollama) no debe inundar la
+/// terminal.
+const MAX_SHOWN_CHARS: usize = 2000;
+
+/// Recorta `s` a `MAX_SHOWN_CHARS` caracteres, indicando cuánto se omitió.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(MAX_SHOWN_CHARS) {
+        None => s.to_string(),
+        Some((cut, _)) => format!("{}… ({} bytes más)", &s[..cut], s.len() - cut),
     }
-    if !result.reason.is_empty() {
-        lines.push(format!("[reli] motivo: {}", result.reason));
-    }
-    if let Some(p) = &result.proposal {
-        lines.push(format!("[reli] propuesta: {p}"));
-    }
-    for t in &result.trace {
-        lines.push(format!("[reli] trace: {t}"));
-    }
-    lines.iter().map(|l| sanitize_for_terminal(l)).collect()
 }
 
-fn render_proposal_summary(proposal: &serde_json::Value, result: &AgentRunResult) -> String {
-    let tool = proposal.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
-    let args = proposal
-        .get("args")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "{}".into());
-    format!(
-        "[reli] propuesta a ejecutar\n  tool: {}\n  args: {}\n  critic: {} ({})",
-        sanitize_for_terminal(tool),
-        sanitize_for_terminal(&args),
-        sanitize_for_terminal(&result.verdict),
-        sanitize_for_terminal(&result.critic_stage)
-    )
+/// Líneas a mostrar del resultado del agente, ya saneadas y recortadas.
+fn agent_result_lines(result: &AgentRunResult) -> Vec<String> {
+    let shown = |label: &str, text: &str| format!("[reli] {label}: {}", shown(text, &[]));
+    let mut lines = vec![shown("agente: verdict", &result.verdict)];
+    if !result.critic_stage.is_empty() {
+        lines.push(shown("crítico: stage", &result.critic_stage));
+    }
+    if !result.reason.is_empty() {
+        lines.push(shown("motivo", &result.reason));
+    }
+    if let Some(p) = &result.proposal {
+        lines.push(shown("propuesta", p.get()));
+    }
+    for t in result.trace.iter().take(20) {
+        lines.push(shown("trace", t));
+    }
+    lines
+}
+
+/// Texto externo listo para la terminal: primero se escapa (puede crecer
+/// hasta 6 veces) y después se recorta, para que el tope sea real.
+fn shown(text: &str, keep: &[char]) -> String {
+    clip(&escape_unsafe_chars(text, keep))
+}
+
+/// Lo que ve el humano antes de aprobar: la acción ya interpretada (la misma
+/// que se ejecutará), con el contenido recortado y su tamaño real.
+fn render_proposal_summary(action: &Action, verdict: &str, stage: &str) -> String {
+    let mut out = format!(
+        "[reli] propuesta a ejecutar\n  tool: {}\n  path: {}",
+        action.tool(),
+        shown(action.path(), &[])
+    );
+    if let Action::Write { content, .. } = action {
+        // Saltos de línea conservados para que el contenido se pueda leer.
+        out.push_str(&format!(
+            "\n  content ({} bytes):\n{}",
+            content.len(),
+            shown(content, &['\n'])
+        ));
+    }
+    out.push_str(&format!(
+        "\n  critic: {} ({})",
+        shown(verdict, &[]),
+        shown(stage, &[])
+    ));
+    out
 }
 
 /// Acción del kernel, venga de la CLI (`reli write/read/ls`) o de una
@@ -564,25 +894,31 @@ enum Refusal {
     Kernel(KernelError),
 }
 
+/// Forma de la propuesta en el cable. Solo los campos que se usan; serde
+/// salta los demás sin construirlos (no hay árbol JSON en memoria).
+#[derive(serde::Deserialize)]
+struct WireProposal {
+    tool: Option<String>,
+    args: Option<WireArgs>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireArgs {
+    path: Option<String>,
+    content: Option<String>,
+}
+
 /// Convierte la propuesta del sidecar en una `Action`. No ejecuta nada.
-fn parse_proposal(proposal: &serde_json::Value) -> Result<Action, String> {
-    let tool = proposal.get("tool").and_then(|v| v.as_str()).unwrap_or("");
-    let args = proposal
-        .get("args")
-        .and_then(|v| v.as_object())
-        .ok_or("propuesta sin args")?;
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or("propuesta sin args.path")?
-        .to_string();
-    match tool {
+fn parse_proposal(proposal: &serde_json::value::RawValue) -> Result<Action, String> {
+    let wire: WireProposal =
+        serde_json::from_str(proposal.get()).map_err(|e| format!("propuesta mal formada: {e}"))?;
+    let args = wire.args.ok_or("propuesta sin args")?;
+    let path = args.path.ok_or("propuesta sin args.path")?;
+    match wire.tool.as_deref().unwrap_or("") {
         "write_file" => {
             let content = args
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or("propuesta write_file sin args.content")?
-                .to_string();
+                .content
+                .ok_or("propuesta write_file sin args.content")?;
             Ok(Action::Write { path, content })
         }
         "read_file" => Ok(Action::Read { path }),
@@ -1128,7 +1464,9 @@ mod tests {
     #[test]
     fn agent_result_lines_are_terminal_safe() {
         let result = AgentRunResult {
-            proposal: Some(serde_json::json!({"tool": null, "reason": HOSTILE})),
+            proposal: Some(raw(
+                &serde_json::json!({"tool": null, "reason": HOSTILE}).to_string()
+            )),
             verdict: format!("reject{HOSTILE}"),
             reason: HOSTILE.into(),
             agent_raw: String::new(),
@@ -1142,16 +1480,11 @@ mod tests {
 
     #[test]
     fn proposal_summary_is_terminal_safe() {
-        let result = AgentRunResult {
-            proposal: None,
-            verdict: "approve".into(),
-            reason: String::new(),
-            agent_raw: String::new(),
-            critic_stage: HOSTILE.into(),
-            trace: vec![],
+        let action = Action::Write {
+            path: HOSTILE.into(),
+            content: HOSTILE.into(),
         };
-        let proposal = serde_json::json!({"tool": HOSTILE, "args": {"path": HOSTILE}});
-        let summary = render_proposal_summary(&proposal, &result);
+        let summary = render_proposal_summary(&action, HOSTILE, HOSTILE);
         summary.lines().for_each(assert_terminal_safe);
     }
 
@@ -1426,29 +1759,320 @@ mod tests {
         );
     }
 
+    fn raw(json: &str) -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string(json.to_string()).unwrap()
+    }
+
     #[test]
     fn proposals_are_parsed_into_actions() {
-        let p = |v: serde_json::Value| parse_proposal(&v);
+        let p = |json: &str| parse_proposal(&raw(json));
         assert!(matches!(
-            p(serde_json::json!({"tool": "write_file", "args": {"path": "a", "content": "x"}})),
+            p(r#"{"tool": "write_file", "args": {"path": "a", "content": "x"}}"#),
             Ok(Action::Write { .. })
         ));
         assert!(matches!(
-            p(serde_json::json!({"tool": "read_file", "args": {"path": "a"}})),
+            p(r#"{"tool": "read_file", "args": {"path": "a"}}"#),
             Ok(Action::Read { .. })
         ));
         assert!(matches!(
-            p(serde_json::json!({"tool": "list_dir", "args": {"path": ""}})),
+            p(r#"{"tool": "list_dir", "args": {"path": ""}}"#),
             Ok(Action::List { .. })
         ));
         for bad in [
-            serde_json::json!({"tool": "write_file", "args": {"path": "a"}}),
-            serde_json::json!({"tool": "read_file", "args": {}}),
-            serde_json::json!({"tool": "read_file"}),
-            serde_json::json!({"tool": "rm_rf", "args": {"path": "a"}}),
+            r#"{"tool": "write_file", "args": {"path": "a"}}"#,
+            r#"{"tool": "read_file", "args": {}}"#,
+            r#"{"tool": "read_file"}"#,
+            r#"{"tool": "rm_rf", "args": {"path": "a"}}"#,
+            r#"{"tool": "read_file", "args": {"path": ["a"]}}"#,
+            r#"[1, 2]"#,
         ] {
-            assert!(p(bad.clone()).is_err(), "{bad}");
+            assert!(p(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn unknown_proposal_fields_are_skipped_not_built() {
+        // Un relleno enorme (p. ej. de un servidor que suplanta a Ollama) se
+        // salta al leer; no se construye un árbol JSON en memoria.
+        let pad = vec!["0"; 200_000].join(",");
+        let json = format!(
+            r#"{{"tool": "write_file", "pad": [{pad}], "args": {{"path": "a", "content": "x", "pad": [{pad}]}}}}"#
+        );
+        assert!(matches!(p_ok(&json), Action::Write { .. }));
+    }
+
+    fn p_ok(json: &str) -> Action {
+        parse_proposal(&raw(json)).expect("valid proposal")
+    }
+
+    #[test]
+    fn displayed_agent_output_is_clipped() {
+        let big = "x".repeat(50_000);
+        let result = AgentRunResult {
+            proposal: Some(raw(&format!(r#"{{"tool": null, "reason": "{big}"}}"#))),
+            verdict: "reject".into(),
+            reason: big.clone(),
+            agent_raw: big.clone(),
+            critic_stage: "deterministic".into(),
+            trace: vec![big.clone()],
+        };
+        for line in agent_result_lines(&result) {
+            assert!(
+                line.chars().count() < MAX_SHOWN_CHARS + 100,
+                "{} chars",
+                line.len()
+            );
+        }
+    }
+
+    #[test]
+    fn approval_summary_shows_path_and_bounded_content() {
+        let content = "línea\n".repeat(5_000);
+        let action = Action::Write {
+            path: "notas/a.txt".into(),
+            content: content.clone(),
+        };
+        let summary = render_proposal_summary(&action, "approve", "ok");
+        assert!(summary.contains("notas/a.txt"), "{summary}");
+        assert!(summary.contains(&content.len().to_string()), "{summary}");
+        assert!(summary.chars().count() < MAX_SHOWN_CHARS + 400);
+        summary.lines().for_each(assert_terminal_safe);
+    }
+
+    // --- Intérprete del sidecar --------------------------------------------
+
+    /// Simula una instalación de release: `<dir>/python/...` junto a `reli`.
+    fn release_dir_with_bundled_python() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let py = bundled_python(tmp.path());
+        std::fs::create_dir_all(py.parent().unwrap()).unwrap();
+        std::fs::write(&py, b"").unwrap();
+        tmp
+    }
+
+    fn trusted(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resolve(flag: Option<&str>, env: Option<&str>, exe_dir: Option<&Path>) -> PythonChoice {
+        resolve_python(
+            flag.map(PathBuf::from),
+            env.map(Into::into),
+            exe_dir,
+            Path::new("/caller/cwd"),
+            trusted,
+        )
+    }
+
+    #[test]
+    fn explicit_python_flag_wins() {
+        let release = release_dir_with_bundled_python();
+        let abs = std::env::temp_dir().join("py").join("python3");
+        let chosen = resolve(abs.to_str(), Some("/env/python"), Some(release.path()));
+        assert_eq!(chosen.path, abs);
+        assert_eq!(chosen.source, PythonSource::Flag);
+    }
+
+    #[test]
+    fn reli_python_env_wins_over_the_bundled_interpreter() {
+        let release = release_dir_with_bundled_python();
+        let abs = std::env::temp_dir().join("env").join("python");
+        let chosen = resolve(None, abs.to_str(), Some(release.path()));
+        assert_eq!(chosen.path, abs);
+        assert_eq!(chosen.source, PythonSource::Env);
+    }
+
+    #[test]
+    fn bundled_interpreter_next_to_the_binary_is_used() {
+        let release = release_dir_with_bundled_python();
+        let chosen = resolve(None, None, Some(release.path()));
+        assert_eq!(chosen.path, bundled_python(release.path()));
+        assert_eq!(chosen.source, PythonSource::Bundled);
+        let expected_tail = if cfg!(windows) {
+            Path::new("python").join("python.exe")
+        } else {
+            Path::new("python").join("bin").join("python3")
+        };
+        assert!(chosen.path.ends_with(expected_tail));
+    }
+
+    #[test]
+    fn falls_back_to_the_path_interpreter() {
+        let empty = TempDir::new().unwrap();
+        let fallback = PathBuf::from(if cfg!(windows) { "python" } else { "python3" });
+        let chosen = resolve(None, None, Some(empty.path()));
+        assert_eq!(
+            (chosen.path, chosen.source),
+            (fallback.clone(), PythonSource::Path)
+        );
+        assert_eq!(resolve(None, Some(""), None).path, fallback);
+    }
+
+    #[test]
+    fn relative_interpreter_paths_are_resolved_against_the_callers_cwd() {
+        // Sin esto, Unix los resolvía contra el cwd del hijo (el directorio
+        // de reli) y Windows contra el del padre.
+        let rel = Path::new("venv").join("bin").join("python");
+        let chosen = resolve(rel.to_str(), None, None);
+        assert_eq!(chosen.path, Path::new("/caller/cwd").join(&rel));
+        // Un nombre sin separadores se busca en el PATH: se deja igual.
+        assert_eq!(
+            resolve(Some("python3.12"), None, None).path,
+            PathBuf::from("python3.12")
+        );
+    }
+
+    #[test]
+    fn untrusted_bundled_interpreter_is_skipped_with_a_warning() {
+        let release = release_dir_with_bundled_python();
+        let chosen = resolve_python(None, None, Some(release.path()), Path::new("/c"), |_| {
+            Err("python/ is writable by others".into())
+        });
+        assert_eq!(chosen.source, PythonSource::Path);
+        let warning = chosen.warning.expect("the user must be told");
+        assert!(warning.contains("writable by others"), "{warning}");
+    }
+
+    #[test]
+    fn verbatim_windows_prefix_is_hidden_when_shown() {
+        assert_eq!(
+            shown_path(Path::new(r"\\?\C:\rel\python\python.exe")),
+            r"C:\rel\python\python.exe"
+        );
+        // UNC y rutas normales, sin cambios.
+        assert_eq!(
+            shown_path(Path::new(r"\\?\UNC\srv\share\p.exe")),
+            r"\\?\UNC\srv\share\p.exe"
+        );
+        assert_eq!(
+            shown_path(Path::new("/opt/reli/python/bin/python3")),
+            "/opt/reli/python/bin/python3"
+        );
+    }
+
+    #[test]
+    fn bundle_trust_requires_same_owner_and_no_foreign_write_access() {
+        let owner = 1000;
+        let check =
+            |uid, mode| check_owner_and_mode(&[(PathBuf::from("python/bin"), uid, mode)], owner);
+        assert!(
+            check_owner_and_mode(
+                &[
+                    (PathBuf::from("python"), 1000, 0o40755),
+                    (PathBuf::from("python/bin/python3"), 1000, 0o100755)
+                ],
+                owner
+            )
+            .is_ok()
+        );
+        assert!(check(0, 0o40755).is_ok(), "root may own it");
+        assert!(check(1001, 0o40755).is_err());
+        assert!(check(1000, 0o40775).is_err(), "group-writable");
+        assert!(check(1000, 0o40757).is_err(), "world-writable");
+        // El error nombra el elemento culpable.
+        assert!(check(1000, 0o40775).unwrap_err().contains("python/bin"));
+        assert!(check(1001, 0o40755).unwrap_err().contains("python/bin"));
+    }
+
+    /// Árbol mínimo con la forma del release en Unix, con modos 755/644.
+    #[cfg(unix)]
+    fn fake_unix_bundle() -> (TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("rel");
+        let pkg = root.join("python/lib/python3.12/site-packages/reliagent_python");
+        std::fs::create_dir_all(pkg.join("prompts")).unwrap();
+        std::fs::create_dir_all(root.join("python/lib/python3.12/json")).unwrap();
+        std::fs::create_dir_all(root.join("python/bin")).unwrap();
+        std::fs::write(root.join("python/bin/python3.12"), "").unwrap();
+        std::os::unix::fs::symlink("python3.12", root.join("python/bin/python3")).unwrap();
+        std::fs::write(pkg.join("main.py"), "").unwrap();
+        std::fs::write(pkg.join("prompts/system_agent.md"), "").unwrap();
+        for entry in walk(&root) {
+            let mode = if entry.is_dir() { 0o755 } else { 0o644 };
+            if !entry.is_symlink() {
+                std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        }
+        (tmp, root)
+    }
+
+    #[cfg(unix)]
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = vec![dir.to_path_buf()];
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && !path.is_symlink() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_trust_covers_site_packages_and_the_sidecar_package() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let check = |root: &Path| {
+            let owner = std::fs::metadata(root).unwrap().uid();
+            bundle_entries(root).and_then(|e| check_owner_and_mode(&e, owner))
+        };
+        let set = |p: PathBuf, mode| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let site = "python/lib/python3.12/site-packages";
+
+        let (_tmp, root) = fake_unix_bundle();
+        assert_eq!(check(&root), Ok(()));
+
+        set(root.join(site), 0o777);
+        assert!(
+            check(&root).unwrap_err().contains("writable"),
+            "site-packages"
+        );
+        set(root.join(site), 0o755);
+
+        let stdlib_subdir = root.join("python/lib/python3.12/json");
+        set(stdlib_subdir.clone(), 0o775);
+        assert!(
+            check(&root).unwrap_err().contains("writable"),
+            "stdlib subdir"
+        );
+        set(stdlib_subdir, 0o755);
+
+        let prompt = root
+            .join(site)
+            .join("reliagent_python/prompts/system_agent.md");
+        set(prompt.clone(), 0o666);
+        assert!(
+            check(&root).unwrap_err().contains("writable"),
+            "file in the package"
+        );
+        set(prompt.clone(), 0o644);
+
+        std::fs::remove_file(&prompt).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &prompt).unwrap();
+        assert!(check(&root).unwrap_err().contains("symbolic link"));
+        std::fs::remove_file(&prompt).unwrap();
+
+        std::fs::remove_dir_all(root.join(site).join("reliagent_python")).unwrap();
+        assert!(check(&root).unwrap_err().contains("not installed"));
+    }
+
+    #[test]
+    fn sidecar_working_directory_is_never_a_relative_python_core() {
+        // Antes era ./python-core: no existe fuera del repo y, sin -I, era
+        // una vía para cargar código del directorio actual.
+        let release = TempDir::new().unwrap();
+        assert_eq!(default_sidecar_cwd(Some(release.path())), release.path());
+        let fallback = default_sidecar_cwd(None);
+        assert!(
+            fallback.is_absolute() && fallback.is_dir(),
+            "{}",
+            fallback.display()
+        );
     }
 
     fn parse_run(args: &[&str]) -> (String, bool) {
@@ -1530,5 +2154,14 @@ mod tests {
     fn other_errors_have_no_hint() {
         assert!(sidecar_hint(&rpc_error(-32603, None)).is_none());
         assert!(sidecar_hint(&KernelError::Bridge("x".into())).is_none());
+    }
+
+    #[test]
+    fn sidecar_that_died_on_start_gets_the_setup_hint() {
+        let hint = sidecar_hint(&KernelError::Bridge("sidecar closed stdout".into())).unwrap();
+        assert!(
+            hint.contains("RELI_PYTHON") && hint.contains("--python"),
+            "{hint}"
+        );
     }
 }

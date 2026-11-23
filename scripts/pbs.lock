@@ -1,0 +1,28 @@
+# python-build-standalone pin — the Python runtime bundled with `reli`.
+#
+# Read by scripts/fetch_pbs.sh (and therefore by the release workflow).
+# Every archive is checked against the SHA-256 below before it is
+# extracted; a mismatch is a hard stop.
+#
+# Source of the digests: the SHA256SUMS file of the release, fetched over
+# HTTPS from
+#   https://github.com/astral-sh/python-build-standalone/releases/tag/20261026
+#
+# To bump: pick a release at least two weeks old, keep Python 3.12.x
+# (python-core/pyproject.toml requires >=3.12), replace `tag`, `python`
+# and every digest line from that release's SHA256SUMS, and run
+# scripts/package_release.sh on at least one platform.
+#
+# Format of the digest lines (two spaces between fields):
+#   <sha256 hex>  <rust target triple>
+
+tag 20261026
+python 3.12.16
+flavor install_only_stripped
+
+ce4f6d0a6cfdb3bed6e44c2f9affd85943c76a42e25ad3a259002f31d6fb8a20  x86_64-unknown-linux-gnu
+bb4b6392670c5d3f93876996fcaa19858a4a413a0c7720144c18b0d6f1f0db2d  aarch64-unknown-linux-gnu
+37c38fda76fec1fbf310adcbafb7f0d96af13b5511bf8ea954c3aa8eec185734  x86_64-apple-darwin
+353d5f1b4fd2715e7053f12f068435d5bbad16b91e057006b5d01e0925709a7e  aarch64-apple-darwin
+1f2ab53880fc67ea323398c6388e05af28addc99a8e389209f08a51fdff4b149  x86_64-pc-windows-msvc
+3b2e4da9209cec3e0eaf4db31176977a88df32d598ff94a7899c34cd8304db04  aarch64-pc-windows-msvc

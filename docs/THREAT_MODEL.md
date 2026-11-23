@@ -111,10 +111,14 @@ They are documented here so no user is surprised.
   user account, they can read the keyring, decrypt or forge log entries,
   replace the binary on disk, or intercept TTY approvals. This is the
   classic threat-model boundary of a user-space trusted kernel.
-- **Supply-chain compromise.** A malicious Rust crate, Python wheel, or
+- **Supply-chain compromise.** A malicious Rust crate, Python runtime or
   Ollama binary can undermine everything above. Mitigations: pinned
-  versions, `cargo --locked` in CI, SBOM + `cosign` signature on releases
-  (tracked in §6 and the release workflow).
+  versions, `cargo --locked` in CI, a sidecar with no third-party Python
+  dependencies, SBOM + `cosign` signature on releases. The bundled
+  python-build-standalone runtime is pinned by SHA-256 in
+  `scripts/pbs.lock` and checked before extraction; those digests were
+  copied from the upstream release's `SHA256SUMS` over HTTPS, so they are
+  only as trustworthy as that release was when it was pinned.
 - **Model substitution.** Every `reli run` refuses to infer unless the
   server on `127.0.0.1:11434` reports a Modelfile with a single `FROM`
   (no `ADAPTER`) pointing to the blob pinned in `MODEL_SHA256.txt`, that
@@ -150,6 +154,18 @@ They are documented here so no user is surprised.
   files: someone who saved an old copy of them can restore it together
   with an older, consistent copy of `audit.db` and `anchors/`. Only an
   external or hardware-backed witness (TPM, remote log) would stop that.
+- **The release folder is part of the trusted computing base.** `reli`
+  runs the interpreter in its `python/` folder, which runs the sidecar
+  from its `site-packages`. On Linux/macOS `reli` refuses that folder if
+  any directory of the runtime's `lib/python3.*` tree, the real
+  interpreter or any entry of the `reliagent_python` package is not owned
+  by the owner of `reli` (or root), is writable by group or others, or
+  (inside the package) is a symlink. Standard-library files are covered
+  only through their directories (nobody else can add or swap a module),
+  not one by one. On Windows ACLs are
+  not checked. Anyone who can write the folder (or set `RELI_PYTHON` /
+  `--python`, which skip the check) runs code as the user — the same
+  power as replacing `reli` itself.
 - **Network file systems.** SQLite's file locks are unreliable on SMB/NFS.
   Keep `~/.reliagent/` on a local disk; on a network share two `reli`
   processes could race despite the exclusive lock.

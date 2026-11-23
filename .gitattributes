@@ -1,0 +1,6 @@
+# Text files are stored with LF and checked out with LF on every platform,
+# whatever core.autocrlf says: the bash scripts (scripts/*.sh) and
+# scripts/pbs.lock break with CRLF, which a Windows checkout with
+# core.autocrlf=true (the default on GitHub's Windows runners) would
+# otherwise produce. Files git detects as binary are left untouched.
+* text=auto eol=lf

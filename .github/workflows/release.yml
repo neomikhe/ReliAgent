@@ -2,21 +2,32 @@
 #
 # Trigger: pushing a tag matching v*.*.* (e.g. v0.1.0).
 #
-# What it does (per platform):
-#   1. Build the `reli` binary with the pinned Rust toolchain.
-#   2. Run unit, integration, and red-team tests.
-#   3. Generate an SBOM with Syft (SPDX + CycloneDX).
-#   4. Keyless-sign every released artifact with cosign via GitHub OIDC.
-#   5. Upload the binary, SBOMs, and detached signatures to the GitHub
-#      release.
+# Two jobs, so the code that runs third-party build scripts never holds the
+# signing identity or a write token:
 #
-# Verification (for end users):
+#   build (per platform, read-only token, no OIDC):
+#     1. Check the tag name, remap local paths out of the binary.
+#     2. fmt, clippy, build, unit + integration + red-team tests.
+#     3. Bundle the binary with the pinned Python runtime and the sidecar
+#        (scripts/package_release.sh), smoke-test it, run the sidecar
+#        isolation tests against the bundled interpreter.
+#     4. Archive the bundle (files owned by uid 0) and generate its SBOM
+#        (SPDX + CycloneDX) with Syft.
+#
+#   release (OIDC + write token, runs no project code):
+#     5. Keyless-sign every archive and SBOM with cosign, attest build
+#        provenance, upload everything to a draft GitHub release.
+#
+# Every action is pinned to a full commit SHA (version in the comment).
+#
+# Verification (for end users) — see the release notes for the exact
+# identity of each tag:
 #   cosign verify-blob \
-#       --certificate reli.cert \
-#       --signature   reli.sig  \
-#       --certificate-identity-regexp 'https://github\.com/<org>/reliagent/\.github/workflows/release\.yml@refs/tags/v.*' \
-#       --certificate-oidc-issuer      'https://token.actions.githubusercontent.com' \
-#       reli
+#       --certificate <archive>.cert --signature <archive>.sig \
+#       --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>" \
+#       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#       <archive>
+#   gh attestation verify <archive> --repo <owner>/<repo>
 
 name: release
 
@@ -26,14 +37,14 @@ on:
       - 'v*.*.*'
 
 permissions:
-  contents: write     # create/update releases
-  id-token: write     # cosign keyless OIDC
-  attestations: write # GitHub attestation API
+  contents: read
 
 jobs:
   build:
     name: build-${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -41,146 +52,227 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             binary: reli
-            archive: reli-${{ github.ref_name }}-linux-x86_64.tar.gz
+            platform: linux-x86_64
+            ext: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
             binary: reli
-            archive: reli-${{ github.ref_name }}-macos-aarch64.tar.gz
+            platform: macos-aarch64
+            ext: tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             binary: reli.exe
-            archive: reli-${{ github.ref_name }}-windows-x86_64.zip
+            platform: windows-x86_64
+            ext: zip
+    env:
+      TARGET: ${{ matrix.target }}
+      BINARY: ${{ matrix.binary }}
+      PLATFORM: ${{ matrix.platform }}
+      EXT: ${{ matrix.ext }}
 
     steps:
-      - uses: actions/checkout@v4
+      # The tag ends up in file names and shell commands: accept only plain
+      # semver tags before using it anywhere.
+      - name: check tag name
+        shell: bash
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "refusing to release tag '${GITHUB_REF_NAME}'" >&2
+              exit 1
+          fi
+          bundle="reli-${GITHUB_REF_NAME}-${PLATFORM}"
+          echo "BUNDLE=${bundle}" >> "$GITHUB_ENV"
+          echo "ARCHIVE=${bundle}.${EXT}" >> "$GITHUB_ENV"
 
-      - name: install rust
-        uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          toolchain: '1.85.0'
-          targets: ${{ matrix.target }}
-          components: clippy, rustfmt
+          persist-credentials: false
+
+      # rustc records source paths (cargo registry, checkout) for panic
+      # messages; remap them so the binary carries no runner paths.
+      # package_release.sh fails if any build path is left in the bundle.
+      - name: path remapping for every cargo step
+        shell: bash
+        run: echo "CARGO_ENCODED_RUSTFLAGS=$(bash scripts/release_rustflags.sh)" >> "$GITHUB_ENV"
+
+      # The toolchain version comes from rust-toolchain.toml.
+      - name: install rust
+        shell: bash
+        run: |
+          channel="$(awk -F'"' '/^channel/ { print $2 }' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal \
+              --component clippy,rustfmt --target "${TARGET}"
+          rustup default "${channel}"
+
+      # keyring's Secret Service backend links libdbus (libdbus-sys finds it
+      # through pkg-config); the macOS and Windows backends need nothing.
+      - name: system libraries (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
 
       - name: cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
 
       - name: fmt + clippy
+        shell: bash
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --release --target ${{ matrix.target }} -- -D warnings
+          cargo clippy --all-targets --release --target "${TARGET}" -- -D warnings
 
       - name: build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        shell: bash
+        run: cargo build --release --locked --target "${TARGET}"
 
       - name: unit + integration + red-team tests
-        run: |
-          cargo test --release --locked --target ${{ matrix.target }}
-          cargo test --release --locked --target ${{ matrix.target }} --test red_team
+        shell: bash
+        run: cargo test --release --locked --target "${TARGET}"
 
-      - name: stage artifacts
+      # Binary + python-build-standalone runtime pinned in scripts/pbs.lock
+      # (SHA-256 checked before extraction) + the stdlib-only sidecar, then
+      # a smoke test of a copy of the bundle.
+      - name: bundle and smoke-test
         shell: bash
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
-          cp README.md LICENSE SECURITY.md KNOWN_ISSUES.md dist/ || true
-          cp -r docs dist/docs || true
+          bash scripts/package_release.sh "${TARGET}" \
+              "target/${TARGET}/release/${BINARY}" "dist/${BUNDLE}"
 
-      - name: package
+      # The sidecar isolation tests (#[ignore], they need reliagent_python
+      # installed) run against the interpreter that actually ships, on a
+      # copy so the bundle stays untouched.
+      - name: sidecar tests against the bundled interpreter
         shell: bash
         run: |
-          cd dist
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-              7z a -tzip ../${{ matrix.archive }} .
+          rm -rf "${RUNNER_TEMP}/bundle-copy"
+          cp -R "dist/${BUNDLE}" "${RUNNER_TEMP}/bundle-copy"
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+              py="$(cygpath -w "${RUNNER_TEMP}/bundle-copy/python/python.exe")"
           else
-              tar -czf ../${{ matrix.archive }} .
+              py="${RUNNER_TEMP}/bundle-copy/python/bin/python3"
           fi
+          RELI_TEST_PYTHON="${py}" cargo test --release --locked \
+              --target "${TARGET}" --test bridge_jsonrpc -- --ignored
 
-      - name: generate SBOM (SPDX + CycloneDX)
-        uses: anchore/sbom-action@v0
-        with:
-          path: ./
-          format: spdx-json
-          output-file: ${{ matrix.archive }}.spdx.json
-
-      - name: generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
-        with:
-          path: ./
-          format: cyclonedx-json
-          output-file: ${{ matrix.archive }}.cdx.json
-
-      - name: install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: cosign sign artifact (keyless OIDC)
-        env:
-          COSIGN_EXPERIMENTAL: '1'
+      # Owner/group 0 inside the archive: extracting as root must not hand
+      # the files to whatever account has the runner's uid. On macOS, no
+      # AppleDouble (._*) files or extended attributes: they would end up as
+      # stray files in the bundle on Linux and in the SBOM.
+      - name: archive
         shell: bash
         run: |
-          cosign sign-blob --yes \
-              --output-certificate ${{ matrix.archive }}.cert \
-              --output-signature   ${{ matrix.archive }}.sig  \
-              ${{ matrix.archive }}
-          cosign sign-blob --yes \
-              --output-certificate ${{ matrix.archive }}.spdx.json.cert \
-              --output-signature   ${{ matrix.archive }}.spdx.json.sig  \
-              ${{ matrix.archive }}.spdx.json
-          cosign sign-blob --yes \
-              --output-certificate ${{ matrix.archive }}.cdx.json.cert \
-              --output-signature   ${{ matrix.archive }}.cdx.json.sig  \
-              ${{ matrix.archive }}.cdx.json
+          mkdir -p out
+          cd dist
+          case "${RUNNER_OS}" in
+              Windows) 7z a -tzip "../out/${ARCHIVE}" "${BUNDLE}" ;;
+              macOS)   COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata \
+                           --uid 0 --gid 0 --uname root --gname wheel \
+                           -czf "../out/${ARCHIVE}" "${BUNDLE}" ;;
+              *)       tar --owner=0 --group=0 --numeric-owner -czf "../out/${ARCHIVE}" "${BUNDLE}" ;;
+          esac
 
-      - name: GitHub build provenance attestation
-        uses: actions/attest-build-provenance@v1
+      # The SBOM describes what ships: the bundle directory, not the workspace.
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          subject-path: ${{ matrix.archive }}
+          path: dist/${{ env.BUNDLE }}
+          format: spdx-json
+          output-file: out/${{ env.ARCHIVE }}.spdx.json
+          upload-artifact: false
 
-      - name: upload to release
-        uses: softprops/action-gh-release@v2
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          files: |
-            ${{ matrix.archive }}
-            ${{ matrix.archive }}.cert
-            ${{ matrix.archive }}.sig
-            ${{ matrix.archive }}.spdx.json
-            ${{ matrix.archive }}.spdx.json.cert
-            ${{ matrix.archive }}.spdx.json.sig
-            ${{ matrix.archive }}.cdx.json
-            ${{ matrix.archive }}.cdx.json.cert
-            ${{ matrix.archive }}.cdx.json.sig
-          fail_on_unmatched_files: true
-          draft: true
+          path: dist/${{ env.BUNDLE }}
+          format: cyclonedx-json
+          output-file: out/${{ env.ARCHIVE }}.cdx.json
+          upload-artifact: false
 
-  verification-notes:
-    name: release notes draft
+      - name: hand over to the release job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: sign and publish
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # create/update the draft release
+      id-token: write     # cosign keyless OIDC
+      attestations: write # build provenance
     steps:
-      - uses: actions/checkout@v4
-      - name: write verification instructions
-        uses: softprops/action-gh-release@v2
+      - name: collect artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - name: cosign sign (keyless OIDC)
+        shell: bash
+        run: |
+          cd release
+          shopt -s nullglob
+          files=(reli-*.tar.gz reli-*.zip reli-*.spdx.json reli-*.cdx.json)
+          if [[ ${#files[@]} -ne 9 ]]; then
+              echo "expected 3 archives + 6 SBOMs, got ${#files[@]}: ${files[*]}" >&2
+              exit 1
+          fi
+          for f in "${files[@]}"; do
+              cosign sign-blob --yes \
+                  --output-certificate "${f}.cert" \
+                  --output-signature "${f}.sig" "${f}"
+          done
+
+      - name: build provenance attestation
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+        with:
+          subject-path: |
+            release/reli-*.tar.gz
+            release/reli-*.zip
+
+      - name: upload to the draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
           draft: true
           body: |
             ## Verifying this release
 
-            Every artifact is signed with [cosign](https://github.com/sigstore/cosign)
-            using GitHub OIDC (no long-lived keys). To verify:
+            Every archive and SBOM is signed with [cosign](https://github.com/sigstore/cosign)
+            using GitHub OIDC (no long-lived keys), and every archive has a GitHub
+            build provenance attestation. Verify before extracting:
 
             ```bash
             cosign verify-blob \
-                --certificate reli-${{ github.ref_name }}-<platform>.tar.gz.cert \
-                --signature   reli-${{ github.ref_name }}-<platform>.tar.gz.sig  \
-                --certificate-identity-regexp 'https://github\.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v.*' \
-                --certificate-oidc-issuer      'https://token.actions.githubusercontent.com' \
-                reli-${{ github.ref_name }}-<platform>.tar.gz
+                --certificate <archive>.cert \
+                --signature   <archive>.sig \
+                --certificate-identity "https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/${{ github.ref_name }}" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                <archive>
+
+            gh attestation verify <archive> --repo ${{ github.repository }}
             ```
 
-            The `*.spdx.json` and `*.cdx.json` files are the Software Bill of
-            Materials in SPDX and CycloneDX formats respectively, each with its
-            own signature pair.
+            `<archive>` is `reli-${{ github.ref_name }}-linux-x86_64.tar.gz`,
+            `reli-${{ github.ref_name }}-macos-aarch64.tar.gz` or
+            `reli-${{ github.ref_name }}-windows-x86_64.zip`. The `*.spdx.json` and
+            `*.cdx.json` files are the SBOMs of each archive, each with its own
+            signature pair.
+
+            Extract as the user who will run `reli`, into a directory only that
+            user can write: `reli` trusts the `python/` next to it.
 
             See [`docs/THREAT_MODEL.md`](../blob/${{ github.ref_name }}/docs/THREAT_MODEL.md)
             and [`KNOWN_ISSUES.md`](../blob/${{ github.ref_name }}/KNOWN_ISSUES.md)

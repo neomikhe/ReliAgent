@@ -18,13 +18,21 @@ will show a blue "Windows protected your PC" dialog on first run.
 - **Why:** Code-signing certificates cost money and are issued per
   identity. A signed binary is tracked as a v0.2 milestone (investigating
   [SignPath.io](https://signpath.io/) for OSS).
-- **Workaround:** Click "More info" → "Run anyway", or verify the release
-  signature manually:
+- **Workaround:** verify the archive first, then click "More info" →
+  "Run anyway". What is signed is the archive (`.zip`), not `reli.exe`;
+  the exact identity for each tag is in the release notes:
   ```bash
-  cosign verify-blob --certificate reli.exe.cert --signature reli.exe.sig reli.exe
+  cosign verify-blob \
+      --certificate reli-v0.1.0-windows-x86_64.zip.cert \
+      --signature   reli-v0.1.0-windows-x86_64.zip.sig \
+      --certificate-identity "https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/v0.1.0" \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      reli-v0.1.0-windows-x86_64.zip
+  gh attestation verify reli-v0.1.0-windows-x86_64.zip --repo <owner>/<repo>
   ```
 - **Trust model:** a SmartScreen bypass is not the same as trusting the
-  binary. Verify the cosign signature against our GitHub OIDC identity.
+  binary. Always pass the exact `--certificate-identity`: without it,
+  cosign would accept a signature from *any* GitHub workflow.
 
 ### Antivirus touching the sandbox
 
@@ -71,8 +79,9 @@ different `args_hash` entries even though they hit the same file.
 Same class of issue as Windows SmartScreen. The binary is not notarised
 in v0.1.0.
 
-- **Workaround:** `xattr -d com.apple.quarantine reli` after download, or
-  right-click → Open → confirm once.
+- **Workaround:** after verifying the cosign signature, clear the
+  quarantine flag on the whole extracted folder (it also covers the
+  bundled `python/`): `xattr -dr com.apple.quarantine reli-v0.1.0-macos-aarch64`.
 - **Planned:** Apple Developer ID signing and notarisation are tracked
   for v0.2.
 
@@ -87,19 +96,26 @@ named `reliagent` / `audit-hmac-v1`.
 
 ## Linux
 
-### `libsecret` may be missing on minimal distributions
+### The keyring needs D-Bus and a Secret Service daemon
 
-The `keyring` crate uses the Secret Service API (gnome-keyring or kwallet
-via `libsecret`). On headless servers, minimal containers, or very slim
-distros you may see:
+On Linux the `keyring` crate talks to the Secret Service API over D-Bus
+(gnome-keyring, KeePassXC or KWallet's Secret Service provider). The
+`reli` binary links `libdbus-1.so.3`, present on almost every desktop
+distribution; minimal containers need the `libdbus-1-3` package (Debian/
+Ubuntu) or `dbus-libs` (Fedora) to start at all. Building from source also
+needs the headers and `pkg-config` (`libdbus-1-dev pkg-config` on
+Debian/Ubuntu, `dbus-devel pkgconf` on Fedora).
+
+On headless servers, minimal containers, or very slim distros with no
+Secret Service running you may see:
 
 ```
 keyring error: platform secure storage failure: SS: NoKeyringDaemon
 ```
 
-- **Workaround in v0.1:** install `libsecret-1-0` (Debian/Ubuntu),
-  `libsecret` (Arch), or equivalent. A gnome-keyring daemon must be
-  running (`dbus-run-session -- ...`).
+- **Workaround in v0.1:** install and start a Secret Service provider,
+  e.g. `gnome-keyring` inside a D-Bus session
+  (`dbus-run-session -- ...`).
 - **Planned fallback (v0.2):** an encrypted file at `~/.reliagent/hmac.enc`
   with permissions `0600`, derived from a passphrase on first run. This
   is a strict downgrade versus the native keyring — documented as such
@@ -177,6 +193,69 @@ When stdout is a terminal, `reli read` escapes control characters (escape
 sequences, `\r`, …) and replaces invalid UTF-8, because the file may have
 been written by the model. Newlines and tabs are kept. Pipe or redirect
 the output (`reli read a.bin > a.bin`) to get the exact bytes.
+
+---
+
+## Bundled Python runtime
+
+### Security fixes arrive only with a new pin
+
+Releases ship CPython from python-build-standalone, pinned by tag and
+SHA-256 in [`scripts/pbs.lock`](scripts/pbs.lock) (v0.1.0: Python 3.12.16,
+release `20261026`). It does not update itself: a CPython security fix
+reaches users only when the pin is bumped and a new release is cut. The
+sidecar only uses the standard library and talks to `127.0.0.1`, which
+limits the exposure, but check the pinned version before relying on it.
+
+### Keep `python/` next to `reli`
+
+`reli` looks for `python/` in the directory of its own executable. Moving
+the binary alone (e.g. to `/usr/local/bin`) makes it fall back to the
+`python3` in `PATH`, which normally does not have the sidecar installed;
+`reli ping` then fails with a hint. Move the whole folder, or symlink the
+binary (symlinks are resolved to the real location).
+
+The order is `--python`, then `$RELI_PYTHON`, then the bundled `python/`,
+then `PATH`: a `RELI_PYTHON` left over from a source checkout **wins over
+the bundled runtime**. `reli ping` and `reli run` print which interpreter
+they use and why (`[reli] sidecar: <path> (<source>)`).
+
+### The release folder is trusted code
+
+`reli` runs whatever interpreter sits in its `python/` folder, and that
+interpreter runs the sidecar from its `site-packages`. Whoever can write to
+that folder can run code as you. So:
+
+- **Extract the archive as the user who will run `reli`**, into a
+  directory only that user can write (e.g. under your home). The archives
+  record owner `root`/uid 0, so extracting as root keeps root ownership
+  instead of handing the files to an unrelated account.
+- On Linux and macOS, `reli` refuses the bundled `python/` (and says so)
+  if any checked entry is not owned by the owner of `reli` (or root), or
+  is writable by group or others; it then falls back to `PATH`. Checked:
+  `python/`, `python/bin/`, `python/lib/`, every directory under
+  `python/lib/python3.*/` (`site-packages/` included), the real
+  interpreter (symlinks resolved) and every file and directory of the
+  installed `reliagent_python` package, which may not contain symlinks.
+  Standard-library files are not checked one by one (there are
+  thousands), but all their directories are, so no other account can add
+  or swap a module.
+- On file systems without POSIX permissions (FAT/exFAT drives, some
+  network mounts, `/mnt/c` in WSL without `metadata`), every file looks
+  writable by everyone, so the bundled `python/` is always refused.
+  Extract onto a native file system instead. `--python <dir>/python/bin/python3`
+  (or `RELI_PYTHON`) skips the check entirely: you vouch for that
+  interpreter yourself.
+- On Windows, ACLs are **not** checked: do not put the folder in a
+  location other accounts can write to (e.g. `C:\ProgramData`, a shared
+  drive).
+
+### Size
+
+Almost all of it is the Python runtime. Measured on the v0.1.0 build:
+about 24 MB compressed and 63 MB extracted on Windows, 35 MB and 110 MB on
+Linux (its runtime ships more shared libraries). The macOS archive has
+not been measured outside CI yet.
 
 ---
 

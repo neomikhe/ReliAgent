@@ -9,7 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
-use reliagent::bridge::{Bridge, LlmBackend, SidecarSpec, rpc_codes};
+use std::time::{Duration, Instant};
+
+use reliagent::bridge::{Bridge, BridgeLimits, LlmBackend, SidecarSpec, rpc_codes};
 use reliagent::kernel::KernelError;
 
 fn project_root() -> PathBuf {
@@ -144,6 +146,200 @@ fn rpc_codes_match_python_sidecar() {
     assert_eq!(python_code("RPC_LLM_ERROR"), rpc_codes::LLM_ERROR);
 }
 
+// --- Límites: un sidecar colgado o desbocado no puede bloquear `reli` ------
+
+/// Lee las peticiones y nunca responde.
+const SILENT_SERVER: &str = "import sys\nfor line in sys.stdin:\n    pass\n";
+
+/// Responde con una "línea" sin fin.
+const FLOOD_SERVER: &str = "import sys, time\nsys.stdin.readline()\nsys.stdout.write('x' * 5000)\nsys.stdout.flush()\ntime.sleep(10)\n";
+
+fn spawn_limited(script: &str, limits: BridgeLimits) -> Bridge {
+    let cmd = vec![python_cmd(), "-c".into(), script.to_string()];
+    Bridge::spawn_with_limits(SidecarSpec::ExplicitCommand(cmd), &project_root(), limits)
+        .expect("spawn python fake sidecar")
+}
+
+fn short(rpc_ms: u64, agent_ms: u64) -> BridgeLimits {
+    BridgeLimits {
+        rpc_timeout: Duration::from_millis(rpc_ms),
+        agent_timeout: Duration::from_millis(agent_ms),
+        ..BridgeLimits::default()
+    }
+}
+
+/// Responde al ping y luego sigue vivo ignorando el EOF, con `then`.
+fn answers_ping_then(then: &str) -> String {
+    format!(
+        r#"
+import sys, json, time
+req = json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({{'jsonrpc': '2.0', 'id': req['id'], 'result': {{'pong': True}}}}) + '\n')
+sys.stdout.flush()
+while True:
+    {then}
+"#
+    )
+}
+
+/// `shutdown` en un hilo con plazo: si se colgara, la prueba falla en vez de
+/// bloquear toda la suite.
+fn shutdown_within(script: &str, grace_ms: u64) -> Result<(), KernelError> {
+    let limits = BridgeLimits {
+        shutdown_grace: Duration::from_millis(grace_ms),
+        ..BridgeLimits::default()
+    };
+    let mut bridge = spawn_limited(script, limits);
+    bridge.ping().expect("first answer is a pong");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(bridge.shutdown());
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("shutdown() hung")
+}
+
+#[test]
+fn shutdown_stops_a_sidecar_that_ignores_eof() {
+    let err = shutdown_within(&answers_ping_then("time.sleep(1)"), 500)
+        .expect_err("the sidecar had to be stopped");
+    assert!(format!("{err}").contains("did not exit"), "{err}");
+}
+
+#[test]
+fn shutdown_returns_promptly_while_the_sidecar_keeps_writing() {
+    // Al dejar de leer, el hilo lector suelta el pipe: el sidecar muere por
+    // broken pipe o se le detiene al cumplir el plazo. Lo que se prueba es
+    // que shutdown vuelve (shutdown_within falla si se cuelga).
+    let _ = shutdown_within(
+        &answers_ping_then("sys.stdout.write('x' * 1000 + '\\n'); sys.stdout.flush()"),
+        500,
+    );
+}
+
+/// Ejecuta `f` en un hilo y falla la prueba si no vuelve en `secs`.
+fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(secs))
+        .expect("the bridge call hung")
+}
+
+#[test]
+fn writing_to_a_sidecar_that_never_reads_has_a_deadline() {
+    // Una petición mayor que el buffer del pipe bloquea write_all si el hijo
+    // no lee: también eso tiene que cumplir el plazo.
+    const NEVER_READS: &str = "import time\nwhile True:\n    time.sleep(1)\n";
+    let mut bridge = spawn_limited(NEVER_READS, short(60_000, 1_000));
+    let prompt = "x".repeat(4 * 1024 * 1024);
+    let start = Instant::now();
+    let err = within(20, move || bridge.agent_run(&prompt, LlmBackend::Mock))
+        .expect_err("the fake never reads nor answers");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(format!("{err}").contains("did not answer"), "{err}");
+}
+
+#[test]
+fn bridge_is_unusable_after_a_timeout() {
+    let mut bridge = spawn_limited(SILENT_SERVER, short(300, 300));
+    let first = bridge.ping().expect_err("timeout");
+    assert!(format!("{first}").contains("did not answer"), "{first}");
+    // No un "closed stdout" engañoso: el motivo real sigue siendo el timeout.
+    let second = bridge.ping().expect_err("the bridge is dead");
+    assert!(format!("{second}").contains("did not answer"), "{second}");
+}
+
+#[test]
+fn response_with_another_id_is_rejected() {
+    const WRONG_ID: &str = r#"
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"] + 1, "result": {"pong": True}}) + "\n")
+    sys.stdout.flush()
+"#;
+    let mut bridge = spawn_limited(WRONG_ID, short(10_000, 10_000));
+    let err = bridge.ping().expect_err("id does not match the request");
+    assert!(format!("{err}").contains("id"), "{err}");
+}
+
+#[test]
+fn huge_padded_proposal_passes_through_without_being_parsed() {
+    // El resultado llega como texto (RawValue) hasta la CLI; el relleno no se
+    // convierte en un árbol JSON en ningún punto del bridge.
+    const PADDED: &str = r#"
+import sys, json
+req = json.loads(sys.stdin.readline())
+proposal = {"tool": "write_file", "pad": [0] * 300000, "args": {"path": "a.txt", "content": "x"}}
+result = {"proposal": proposal, "verdict": "reject", "reason": "", "agent_raw": "", "critic_stage": "llm", "trace": []}
+sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": result}) + "\n")
+sys.stdout.flush()
+"#;
+    let mut bridge = spawn_limited(PADDED, short(10_000, 10_000));
+    let result = bridge
+        .agent_run("hola", LlmBackend::Mock)
+        .expect("agent.run");
+    let raw = result.proposal.expect("proposal present");
+    assert!(raw.get().len() > 300_000);
+    assert!(
+        raw.get().starts_with(r#"{"tool": "write_file""#),
+        "{}",
+        &raw.get()[..40]
+    );
+}
+
+#[test]
+fn unresponsive_sidecar_times_out_instead_of_hanging() {
+    let mut bridge = spawn_limited(SILENT_SERVER, short(500, 60_000));
+    let start = Instant::now();
+    let err = bridge.ping().expect_err("the fake never answers");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(format!("{err}").contains("did not answer"), "{err}");
+}
+
+#[test]
+fn agent_run_has_its_own_longer_timeout() {
+    let mut bridge = spawn_limited(SILENT_SERVER, short(60_000, 500));
+    let start = Instant::now();
+    let err = bridge
+        .agent_run("hola", LlmBackend::Mock)
+        .expect_err("the fake never answers");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(format!("{err}").contains("did not answer"), "{err}");
+    assert!(BridgeLimits::default().agent_timeout > BridgeLimits::default().rpc_timeout);
+}
+
+#[test]
+fn endless_response_line_is_cut_off() {
+    let limits = BridgeLimits {
+        max_line_bytes: 1024,
+        ..short(10_000, 10_000)
+    };
+    let mut bridge = spawn_limited(FLOOD_SERVER, limits);
+    let start = Instant::now();
+    let err = bridge.ping().expect_err("line exceeds the cap");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(format!("{err}").contains("too long"), "{err}");
+}
+
 #[test]
 fn sidecar_closed_stdout_is_reported() {
     // Python that immediately exits without reading stdin.
@@ -207,6 +403,7 @@ fn full_python_sidecar_runs_agent() {
         .expect("agent.run");
     assert_eq!(result.verdict, "approve", "result={result:?}");
     let proposal = result.proposal.expect("proposal present");
+    let proposal: serde_json::Value = serde_json::from_str(proposal.get()).unwrap();
     assert_eq!(proposal["args"]["path"], "notes/hi.txt");
     bridge.shutdown().expect("shutdown");
 }
