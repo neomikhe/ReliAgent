@@ -45,7 +45,7 @@ impl ApprovalDecision {
 pub fn request_approval(summary: &str, mode: ApprovalMode) -> ApprovalDecision {
     if mode == ApprovalMode::NonInteractive || !io::stdin().is_terminal() {
         eprintln!("{summary}");
-        eprintln!("[reli] non-interactive: propuesta NO aprobada automáticamente");
+        eprintln!("[reli] non-interactive: proposal automatically NOT approved");
         return ApprovalDecision::AutoRejected;
     }
 
@@ -55,7 +55,7 @@ pub fn request_approval(summary: &str, mode: ApprovalMode) -> ApprovalDecision {
 fn prompt_with_timeout(summary: &str, timeout: Duration) -> ApprovalDecision {
     eprintln!("{summary}");
     eprint!(
-        "[reli] ¿aprobar propuesta? [y/N] (timeout {}s): ",
+        "[reli] approve this proposal? [y/N] (timeout {}s): ",
         timeout.as_secs()
     );
     let _ = io::stderr().flush();
@@ -73,13 +73,13 @@ fn prompt_with_timeout(summary: &str, timeout: Duration) -> ApprovalDecision {
         Err(mpsc::RecvTimeoutError::Timeout) => {
             eprintln!();
             eprintln!(
-                "[reli] timeout ({}s) — propuesta NO aprobada",
+                "[reli] timeout ({}s) — proposal NOT approved",
                 timeout.as_secs()
             );
             ApprovalDecision::Timeout
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            eprintln!("[reli] stdin cerrado — propuesta NO aprobada");
+            eprintln!("[reli] stdin closed — proposal NOT approved");
             ApprovalDecision::AutoRejected
         }
     }

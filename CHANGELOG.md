@@ -35,8 +35,12 @@ the file system; its outcome is recorded in a tamper-evident audit log.
   `--non-interactive` rejects). `--dry-run` and `--mock-llm` for demos.
 - Direct commands `reli write`, `read` and `ls` (policy-checked and
   logged, not prompted), `verify`, `log`, `sandbox path|status`,
-  `reset --wipe-everything` and `ping`. Messages are in Spanish in this
-  release.
+  `reset --wipe-everything` and `ping`. Messages, `--help` and the
+  approval prompt are in English (`y`/`yes` approves; `s`/`si` are
+  accepted too).
+- On a terminal, `reli read` escapes control characters and ends the last
+  line, so its status message never runs into the file's content;
+  redirected, it writes the exact bytes.
 - Logs written by earlier development builds (format v1) are migrated
   one way to v2 on first open, with a backup (`audit.db.schema1.bak`).
 - Red-team suite of 27 vectors (`tests/red_team.rs`); 4 are pinned as

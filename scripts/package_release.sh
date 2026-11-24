@@ -157,12 +157,12 @@ SMOKE_LOG="$(env -u RELI_PYTHON "${SMOKE_RELI}" ping 2>&1)" || {
     exit 1
 }
 echo "${SMOKE_LOG}"
-if [[ "${SMOKE_LOG}" != *"(incluido junto a reli)"* ]]; then
+if [[ "${SMOKE_LOG}" != *"(bundled with reli)"* ]]; then
     echo "[package] smoke test did not use the bundled interpreter" >&2
     exit 1
 fi
 env -u RELI_PYTHON "${SMOKE_RELI}" --non-interactive run --mock-llm --dry-run \
-    "write 'hola' to smoke.txt"
+    "write 'hello' to smoke.txt"
 
 # --- Nothing from the build environment inside the bundle. ----------------
 OUT_ABS="$(cd "${OUT}" && pwd)"

@@ -29,34 +29,50 @@ const EXIT_BRIDGE: i32 = 4;
 const EXIT_TIMEOUT: i32 = 5;
 const EXIT_BUSY: i32 = 6;
 
+// Textos de ayuda en inglés: son la interfaz pública de la CLI.
 #[derive(Parser)]
 #[command(
     name = "reli",
     version,
-    about = "ReliAgent: kernel de políticas y auditoría para agentes de IA locales (v0.1.0 Research Preview)"
+    about = "ReliAgent: policy and audit kernel for local AI agents (v0.1.0 Research Preview)"
 )]
 struct Cli {
-    /// Ruta raíz del sandbox. Por defecto: ~/ReliAgent_Sandbox
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Sandbox root directory [default: ~/ReliAgent_Sandbox]"
+    )]
     sandbox: Option<PathBuf>,
 
-    /// Directorio donde vive el audit.db y los anchor.log. Por defecto: ~/.reliagent
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Directory that holds audit.db and the anchor logs [default: ~/.reliagent]"
+    )]
     audit_dir: Option<PathBuf>,
 
-    /// Intérprete Python para el sidecar (con `reliagent_python` instalado).
-    /// Por defecto: $RELI_PYTHON, el incluido en el release junto a `reli`,
-    /// o python3/python del PATH.
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Python interpreter for the sidecar, with `reliagent_python` installed \
+                [default: $RELI_PYTHON, the interpreter bundled next to `reli`, \
+                or python3/python from PATH]"
+    )]
     python: Option<PathBuf>,
 
-    /// Directorio de trabajo del sidecar Python. Por defecto: el de `reli`.
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Working directory of the Python sidecar [default: the directory of `reli`]"
+    )]
     python_cwd: Option<PathBuf>,
 
-    /// No pedir confirmación por TTY — si el agente propone una acción,
-    /// será rechazada automáticamente (modo seguro para scripts).
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Never ask on the TTY: any action the agent proposes is rejected \
+                automatically (safe mode for scripts)"
+    )]
     non_interactive: bool,
 
     #[command(subcommand)]
@@ -65,69 +81,78 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Escribe un archivo dentro del sandbox y registra la acción en el log firmado
+    #[command(about = "Write a file inside the sandbox and record the action in the signed log")]
     Write {
-        /// Ruta relativa al sandbox
+        #[arg(help = "Path relative to the sandbox")]
         path: String,
-        /// Contenido a escribir
+        #[arg(help = "Content to write")]
         content: String,
     },
-    /// Lee un archivo dentro del sandbox. Imprime el contenido en stdout.
+    #[command(about = "Read a file inside the sandbox and print its content to stdout")]
     Read {
-        /// Ruta relativa al sandbox
+        #[arg(help = "Path relative to the sandbox")]
         path: String,
     },
-    /// Lista el contenido de un directorio dentro del sandbox.
+    #[command(about = "List a directory inside the sandbox")]
     Ls {
-        /// Ruta relativa (opcional). Por defecto lista la raíz del sandbox.
+        #[arg(help = "Path relative to the sandbox [default: the sandbox root]")]
         path: Option<String>,
     },
-    /// Comandos del sandbox.
+    #[command(about = "Sandbox commands")]
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
     },
-    /// Verifica la integridad del audit log persistente (SQLite + anchor.log).
+    #[command(about = "Verify the integrity of the persistent audit log (SQLite + anchor log)")]
     Verify,
-    /// Muestra el audit log como JSON Lines (una entrada por línea) sin
-    /// modificar nada. Funciona aunque la verificación falle: es el modo
-    /// solo lectura para leer y exportar el log antes de investigar o de
-    /// `reli reset`.
+    #[command(
+        about = "Print the audit log as JSON Lines without modifying anything",
+        long_about = "Print the audit log as JSON Lines (one entry per line) without \
+                      modifying anything. It works even when verification fails: it is the \
+                      read-only mode to read and export the log before investigating or \
+                      running `reli reset`."
+    )]
     Log,
-    /// Borra completamente el estado del kernel: audit.db, anchors, sandbox
-    /// y la clave HMAC en el keyring. Requiere `--wipe-everything`.
+    #[command(
+        about = "Wipe all kernel state: audit.db, anchors, sandbox and the HMAC key",
+        long_about = "Wipe all kernel state: audit.db, anchors, sandbox and the HMAC key in \
+                      the OS keyring. Requires `--wipe-everything`."
+    )]
     Reset {
-        /// Confirmación obligatoria para ejecutar el reset.
-        #[arg(long)]
+        #[arg(long, help = "Mandatory confirmation to run the reset")]
         wipe_everything: bool,
-        /// Saltar el prompt de confirmación "type WIPE".
-        #[arg(long)]
+        #[arg(long, help = "Skip the confirmation prompt (typing WIPE)")]
         force: bool,
     },
-    /// Corre el orquestador Python con un prompt y, si el crítico aprueba,
-    /// pide confirmación por TTY y ejecuta la propuesta dentro del sandbox.
-    /// Usa Ollama en 127.0.0.1:11434 con el modelo fijado en MODEL_SHA256.txt.
+    #[command(
+        about = "Run the agent on a prompt and, once approved, execute its proposal",
+        long_about = "Run the Python orchestrator on a prompt and, if the critics approve, \
+                      ask for confirmation on the TTY and execute the proposal inside the \
+                      sandbox. Uses Ollama at 127.0.0.1:11434 with the model pinned in \
+                      MODEL_SHA256.txt."
+    )]
     Run {
-        /// Prompt en lenguaje natural (p. ej. "write 'hola' to notes/hi.txt")
+        #[arg(help = "Natural-language prompt, e.g. write 'hello' to notes/hi.txt")]
         prompt: String,
-        /// No ejecutar la propuesta — solo mostrarla.
-        #[arg(long)]
+        #[arg(long, help = "Do not execute the proposal, only show it")]
         dry_run: bool,
-        /// Usar el agente determinista de pruebas en lugar de Ollama (no
-        /// requiere Ollama ni el modelo; solo entiende frases simples como
-        /// "write 'x' to a.txt", "read a.txt" o "list").
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Use the deterministic test agent instead of Ollama (needs neither \
+                    Ollama nor the model; it only understands simple phrases such as \
+                    `write 'x' to a.txt`, `read a.txt` or `list`)"
+        )]
         mock_llm: bool,
     },
-    /// Diagnóstico: lanza el sidecar Python y envía un `ping`.
+    #[command(about = "Diagnostics: start the Python sidecar and send a `ping`")]
     Ping,
 }
 
 #[derive(Subcommand)]
 enum SandboxAction {
-    /// Muestra la ruta del sandbox resuelta
+    #[command(about = "Print the resolved sandbox path")]
     Path,
-    /// Resumen del estado del kernel: sandbox, audit, keyring.
+    #[command(about = "Summary of the kernel state: sandbox, audit log and keyring")]
     Status,
 }
 
@@ -207,7 +232,7 @@ impl PythonSource {
         match self {
             PythonSource::Flag => "--python",
             PythonSource::Env => "RELI_PYTHON",
-            PythonSource::Bundled => "incluido junto a reli",
+            PythonSource::Bundled => "bundled with reli",
             PythonSource::Path => "PATH",
         }
     }
@@ -260,7 +285,7 @@ fn resolve_python(
                 Ok(()) => return choice(bundled, PythonSource::Bundled),
                 Err(why) => {
                     warning = Some(format!(
-                        "se ignora el Python incluido en {}: {why}",
+                        "ignoring the bundled Python in {}: {why}",
                         dir.join("python").display()
                     ))
                 }
@@ -435,13 +460,13 @@ fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     let (key, created) = match keyring::load_or_create_audit_key() {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("[reli] error al acceder al keyring: {}", error_text(&e));
+            eprintln!("[reli] cannot access the keyring: {}", error_text(&e));
             return Err(EXIT_AUDIT);
         }
     };
     if created {
         eprintln!(
-            "[reli] nueva clave HMAC generada y guardada en keyring ({})",
+            "[reli] new HMAC key generated and stored in the keyring ({})",
             keyring::account_label()
         );
     }
@@ -452,12 +477,12 @@ fn load_audit_store(audit_dir: &Path) -> Result<AuditStore, i32> {
     warn_if_audit_dir_is_shared(audit_dir);
     opened.map_err(|e| {
         // El texto puede venir del propio archivo (manipulado): se sanea.
-        eprintln!("[reli] error inicializando audit store: {}", error_text(&e));
+        eprintln!("[reli] cannot open the audit store: {}", error_text(&e));
         if matches!(e, KernelError::AuditCorrupted { .. }) {
             eprintln!(
-                "[reli] el log no supera la verificación: no se ejecuta ninguna acción. \
-                 `reli log` lo muestra y exporta sin modificarlo; si borraste ~/.reliagent \
-                 a mano, usa `reli reset --wipe-everything`"
+                "[reli] the log fails verification: no action will run. \
+                 `reli log` shows and exports it without modifying it; if you deleted \
+                 ~/.reliagent by hand, run `reli reset --wipe-everything`"
             );
         }
         store_error_exit(&e)
@@ -476,8 +501,8 @@ fn warn_if_audit_dir_is_shared(audit_dir: &Path) {
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         eprintln!(
-            "[reli] aviso: {} tiene permisos {mode:o}: otros usuarios pueden ver (o \
-             tocar) el log. Usa `chmod 700` sobre ese directorio",
+            "[reli] warning: {} has mode {mode:o}: other users can read (or \
+             change) the log. Run `chmod 700` on that directory",
             shown_path(audit_dir)
         );
     }
@@ -496,7 +521,7 @@ fn store_error_exit(e: &KernelError) -> i32 {
 
 fn open_sandbox(sandbox_path: &Path) -> Result<Sandbox, i32> {
     Sandbox::open(sandbox_path).map_err(|e| {
-        eprintln!("[reli] error al abrir el sandbox: {e}");
+        eprintln!("[reli] cannot open the sandbox: {e}");
         EXIT_BAD_INPUT
     })
 }
@@ -587,7 +612,7 @@ pub fn run() -> i32 {
 
 fn spawn_bridge(python: &PythonChoice, python_cwd: &Path) -> Result<Bridge, i32> {
     if let Some(warning) = &python.warning {
-        eprintln!("[reli] aviso: {}", sanitize_for_terminal(warning));
+        eprintln!("[reli] warning: {}", sanitize_for_terminal(warning));
     }
     // Qué intérprete corre el sidecar, y por qué: p. ej. un RELI_PYTHON
     // olvidado gana al Python incluido en el release.
@@ -602,7 +627,7 @@ fn spawn_bridge(python: &PythonChoice, python_cwd: &Path) -> Result<Bridge, i32>
     };
     Bridge::spawn(spec, python_cwd).map_err(|e| {
         eprintln!(
-            "[reli] no se pudo lanzar el sidecar Python ({}): {}",
+            "[reli] could not start the Python sidecar ({}): {}",
             shown_path(python),
             error_text(&e)
         );
@@ -612,11 +637,11 @@ fn spawn_bridge(python: &PythonChoice, python_cwd: &Path) -> Result<Bridge, i32>
 }
 
 /// Cómo dar a `reli` un intérprete con el sidecar instalado.
-const SIDECAR_SETUP_HINT: &str = "[reli] el sidecar necesita un Python 3.12+ con el paquete `reliagent_python` instalado:\n\
-     [reli]   - release: usa el `python/` incluido junto a `reli` (no lo muevas por separado);\n\
-     [reli]   - desde el código: `uv sync` en python-core/ y luego\n\
+const SIDECAR_SETUP_HINT: &str = "[reli] the sidecar needs Python 3.12+ with the `reliagent_python` package installed:\n\
+     [reli]   - release: use the `python/` bundled next to `reli` (do not move them apart);\n\
+     [reli]   - from source: `uv sync` in python-core/, then\n\
      [reli]     RELI_PYTHON=python-core/.venv/bin/python (Windows: python-core\\.venv\\Scripts\\python.exe)\n\
-     [reli]     o `--python <ruta>`.";
+     [reli]     or `--python <path>`.";
 
 fn run_ping(python: &PythonChoice, python_cwd: &Path) -> i32 {
     let mut bridge = match spawn_bridge(python, python_cwd) {
@@ -630,7 +655,7 @@ fn run_ping(python: &PythonChoice, python_cwd: &Path) -> i32 {
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] ping falló: {}", error_text(&e));
+            eprintln!("[reli] ping failed: {}", error_text(&e));
             if let Some(hint) = sidecar_hint(&e) {
                 eprintln!("{hint}");
             }
@@ -653,6 +678,18 @@ fn sanitize_for_terminal(s: &str) -> String {
 /// permitiría sobrescribir la línea) y sustituye bytes que no son UTF-8.
 fn display_safe(bytes: &[u8]) -> String {
     escape_unsafe_chars(&String::from_utf8_lossy(bytes), &['\n', '\t'])
+}
+
+/// Contenido de un archivo para una terminal: `display_safe` y, si no
+/// acaba en salto de línea, se añade uno para que el estado (`[reli] ok`,
+/// que va a stderr) empiece en su propia línea. Solo afecta a lo mostrado:
+/// a un pipe o a un archivo van los bytes tal cual.
+fn terminal_text(bytes: &[u8]) -> String {
+    let mut text = display_safe(bytes);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 fn escape_unsafe_chars(s: &str, keep: &[char]) -> String {
@@ -692,11 +729,11 @@ fn sidecar_hint(err: &KernelError) -> Option<String> {
         return None;
     };
     let hint = match *code {
-        rpc_codes::OLLAMA_UNREACHABLE => "[reli] Ollama no detectado en 127.0.0.1:11434.\n\
-             [reli]   Instálalo desde https://ollama.com y arráncalo (app de escritorio u `ollama serve`).\n\
+        rpc_codes::OLLAMA_UNREACHABLE => "[reli] Ollama not found at 127.0.0.1:11434.\n\
+             [reli]   Install it from https://ollama.com and start it (desktop app or `ollama serve`).\n\
              [reli]     Linux/macOS: curl -fsSL https://ollama.com/install.sh | sh\n\
-             [reli]     Windows: descarga el instalador desde https://ollama.com\n\
-             [reli]   Para probar sin Ollama: reli run --mock-llm \"<prompt>\""
+             [reli]     Windows: download the installer from https://ollama.com\n\
+             [reli]   To try it without Ollama: reli run --mock-llm \"<prompt>\""
             .to_string(),
         rpc_codes::MODEL_MISSING => {
             let model = data
@@ -706,17 +743,17 @@ fn sidecar_hint(err: &KernelError) -> Option<String> {
                 .filter(|m| is_safe_model_tag(m));
             match model {
                 Some(m) => format!(
-                    "[reli] Ollama no tiene el modelo fijado. Descárgalo con:\n[reli]   ollama pull {m}"
+                    "[reli] Ollama does not have the pinned model. Pull it with:\n[reli]   ollama pull {m}"
                 ),
-                None => "[reli] Ollama no tiene el modelo fijado. Descarga la etiqueta indicada en MODEL_SHA256.txt con `ollama pull`.".to_string(),
+                None => "[reli] Ollama does not have the pinned model. Pull the tag listed in MODEL_SHA256.txt with `ollama pull`.".to_string(),
             }
         }
-        rpc_codes::MODEL_INTEGRITY => "[reli] El modelo que sirve Ollama no coincide con el SHA-256 fijado en MODEL_SHA256.txt.\n\
-             [reli]   No se ejecutó ninguna inferencia. Vuelve a descargarlo (`ollama rm` + `ollama pull`);\n\
-             [reli]   si el error persiste, trátalo como una posible manipulación del modelo."
+        rpc_codes::MODEL_INTEGRITY => "[reli] The model served by Ollama does not match the SHA-256 pinned in MODEL_SHA256.txt.\n\
+             [reli]   No inference was run. Download it again (`ollama rm` + `ollama pull`);\n\
+             [reli]   if the error persists, treat it as possible tampering with the model."
             .to_string(),
         rpc_codes::LLM_ERROR => {
-            "[reli] Ollama falló durante la generación. Revisa los logs de Ollama y reintenta."
+            "[reli] Ollama failed during generation. Check the Ollama logs and try again."
                 .to_string()
         }
         _ => return None,
@@ -752,7 +789,7 @@ fn run_agent(
     let result = match bridge.agent_run(prompt, backend) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[reli] agent.run falló: {}", error_text(&e));
+            eprintln!("[reli] agent.run failed: {}", error_text(&e));
             if let Some(hint) = sidecar_hint(&e) {
                 eprintln!("{hint}");
             }
@@ -769,14 +806,14 @@ fn run_agent(
         return EXIT_REJECTED;
     }
     if dry_run {
-        println!("[reli] dry-run: propuesta NO ejecutada");
+        println!("[reli] dry-run: proposal NOT executed");
         return EXIT_OK;
     }
 
     let proposal = match &result.proposal {
         Some(p) => p,
         None => {
-            eprintln!("[reli] approve sin propuesta — no se ejecuta nada");
+            eprintln!("[reli] approve without a proposal — nothing will run");
             return EXIT_BAD_INPUT;
         }
     };
@@ -806,22 +843,22 @@ const MAX_SHOWN_CHARS: usize = 2000;
 fn clip(s: &str) -> String {
     match s.char_indices().nth(MAX_SHOWN_CHARS) {
         None => s.to_string(),
-        Some((cut, _)) => format!("{}… ({} bytes más)", &s[..cut], s.len() - cut),
+        Some((cut, _)) => format!("{}… ({} more bytes)", &s[..cut], s.len() - cut),
     }
 }
 
 /// Líneas a mostrar del resultado del agente, ya saneadas y recortadas.
 fn agent_result_lines(result: &AgentRunResult) -> Vec<String> {
     let shown = |label: &str, text: &str| format!("[reli] {label}: {}", shown(text, &[]));
-    let mut lines = vec![shown("agente: verdict", &result.verdict)];
+    let mut lines = vec![shown("agent: verdict", &result.verdict)];
     if !result.critic_stage.is_empty() {
-        lines.push(shown("crítico: stage", &result.critic_stage));
+        lines.push(shown("critic: stage", &result.critic_stage));
     }
     if !result.reason.is_empty() {
-        lines.push(shown("motivo", &result.reason));
+        lines.push(shown("reason", &result.reason));
     }
     if let Some(p) = &result.proposal {
-        lines.push(shown("propuesta", p.get()));
+        lines.push(shown("proposal", p.get()));
     }
     for t in result.trace.iter().take(20) {
         lines.push(shown("trace", t));
@@ -839,7 +876,7 @@ fn shown(text: &str, keep: &[char]) -> String {
 /// que se ejecutará), con el contenido recortado y su tamaño real.
 fn render_proposal_summary(action: &Action, verdict: &str, stage: &str) -> String {
     let mut out = format!(
-        "[reli] propuesta a ejecutar\n  tool: {}\n  path: {}",
+        "[reli] proposal to execute\n  tool: {}\n  path: {}",
         action.tool(),
         shown(action.path(), &[])
     );
@@ -941,19 +978,19 @@ struct WireArgs {
 /// Convierte la propuesta del sidecar en una `Action`. No ejecuta nada.
 fn parse_proposal(proposal: &serde_json::value::RawValue) -> Result<Action, String> {
     let wire: WireProposal =
-        serde_json::from_str(proposal.get()).map_err(|e| format!("propuesta mal formada: {e}"))?;
-    let args = wire.args.ok_or("propuesta sin args")?;
-    let path = args.path.ok_or("propuesta sin args.path")?;
+        serde_json::from_str(proposal.get()).map_err(|e| format!("malformed proposal: {e}"))?;
+    let args = wire.args.ok_or("proposal without args")?;
+    let path = args.path.ok_or("proposal without args.path")?;
     match wire.tool.as_deref().unwrap_or("") {
         "write_file" => {
             let content = args
                 .content
-                .ok_or("propuesta write_file sin args.content")?;
+                .ok_or("write_file proposal without args.content")?;
             Ok(Action::Write { path, content })
         }
         "read_file" => Ok(Action::Read { path }),
         "list_dir" => Ok(Action::List { path }),
-        other => Err(format!("propuesta con tool no soportado: {other:?}")),
+        other => Err(format!("proposal with an unsupported tool: {other:?}")),
     }
 }
 
@@ -1082,8 +1119,8 @@ fn run_action(
         Ok(closed) => {
             for orphan in &closed {
                 eprintln!(
-                    "[reli] seq {} ({}, {}) quedó sin resultado en una sesión anterior: \
-                     registrada como `abandoned` (puede que se ejecutara o no; revisa el sandbox)",
+                    "[reli] seq {} ({}, {}) has no outcome from an earlier session: \
+                     recorded as `abandoned` (it may or may not have run; check the sandbox)",
                     orphan.sequence_no,
                     sanitize_for_terminal(&orphan.tool),
                     sanitize_for_terminal(&orphan.timestamp)
@@ -1091,10 +1128,7 @@ fn run_action(
             }
         }
         Err(e) => {
-            eprintln!(
-                "[reli] error registrando en el audit store: {}",
-                error_text(&e)
-            );
+            eprintln!("[reli] cannot write to the audit store: {}", error_text(&e));
             return store_error_exit(&e);
         }
     }
@@ -1103,13 +1137,13 @@ fn run_action(
         Ok(r) => r,
         Err(e) => {
             // El mensaje dice si la acción llegó a ejecutarse (ver run_audited).
-            eprintln!("[reli] error del audit store: {}", error_text(&e));
+            eprintln!("[reli] audit store error: {}", error_text(&e));
             return store_error_exit(&e);
         }
     };
     if let Err(e) = store.verify() {
         eprintln!(
-            "[reli] audit store corrupto tras registrar: {}",
+            "[reli] audit store corrupted after recording: {}",
             error_text(&e)
         );
         return EXIT_AUDIT;
@@ -1135,7 +1169,7 @@ fn report(
         Ok(Executed::Wrote(n)) => {
             let full = sandbox.root_path().join(action.path());
             println!(
-                "[reli] ok: {n} bytes escritos en {}",
+                "[reli] ok: {n} bytes written to {}",
                 sanitize_for_terminal(&full.display().to_string())
             );
             hmac_to_stdout = true;
@@ -1148,36 +1182,34 @@ fn report(
             // puede haberlo escrito el LLM. El estado va a stderr.
             let stdout = std::io::stdout();
             let shown = if stdout.is_terminal() {
-                display_safe(&bytes).into_bytes()
+                terminal_text(&bytes).into_bytes()
             } else {
                 bytes.clone()
             };
             let mut handle = stdout.lock();
             if let Err(e) = handle.write_all(&shown).and_then(|()| handle.flush()) {
-                eprintln!("[reli] error escribiendo stdout: {e}");
+                eprintln!("[reli] cannot write to stdout: {e}");
                 return EXIT_BAD_INPUT;
             }
-            eprintln!("[reli] ok: {} bytes leídos de {path}", bytes.len());
+            eprintln!("[reli] ok: {} bytes read from {path}", bytes.len());
             EXIT_OK
         }
         Ok(Executed::Listed(entries)) => {
             for entry in &entries {
                 println!("{}", entry_line(entry));
             }
-            eprintln!("[reli] ok: {} entradas", entries.len());
+            eprintln!("[reli] ok: {} entries", entries.len());
             EXIT_OK
         }
         Err(Refusal::Approval(decision)) => {
             let (msg, code) = match decision {
-                ApprovalDecision::Timeout => {
-                    ("timeout de aprobación — no se ejecuta", EXIT_TIMEOUT)
-                }
+                ApprovalDecision::Timeout => ("approval timed out — not executed", EXIT_TIMEOUT),
                 ApprovalDecision::AutoRejected => (
-                    "modo non-interactive — propuesta no ejecutada",
+                    "non-interactive mode — proposal not executed",
                     EXIT_REJECTED,
                 ),
                 _ => (
-                    "usuario rechazó la propuesta — no se ejecuta",
+                    "the user rejected the proposal — not executed",
                     EXIT_REJECTED,
                 ),
             };
@@ -1185,7 +1217,7 @@ fn report(
             code
         }
         Err(Refusal::Kernel(e)) => {
-            eprintln!("[reli] rechazado: {}", error_text(&e));
+            eprintln!("[reli] rejected: {}", error_text(&e));
             if is_policy_rejection(&e) {
                 EXIT_REJECTED
             } else {
@@ -1218,7 +1250,7 @@ fn run_verify(audit_dir: &Path) -> i32 {
     match store.verify() {
         Ok(()) => {
             println!(
-                "[reli] verify ok: {} entradas, hmac final {}",
+                "[reli] verify ok: {} entries, last hmac {}",
                 store.len(),
                 store.last_hmac().unwrap_or("-")
             );
@@ -1227,7 +1259,7 @@ fn run_verify(audit_dir: &Path) -> i32 {
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] verify falló: {}", error_text(&e));
+            eprintln!("[reli] verify failed: {}", error_text(&e));
             EXIT_AUDIT
         }
     }
@@ -1243,7 +1275,7 @@ fn run_log(audit_dir: &Path) -> i32 {
         Ok(true) => {}
         Ok(false) => return report_missing_log(audit_dir, &db_path),
         Err(e) => {
-            eprintln!("[reli] no se pudo comprobar {}: {e}", shown_path(&db_path));
+            eprintln!("[reli] cannot check {}: {e}", shown_path(&db_path));
             return EXIT_AUDIT;
         }
     }
@@ -1251,16 +1283,16 @@ fn run_log(audit_dir: &Path) -> i32 {
     let reader = match LogReader::open(&db_path) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[reli] no se pudo abrir el log: {}", error_text(&e));
+            eprintln!("[reli] cannot open the log: {}", error_text(&e));
             return store_error_exit(&e);
         }
     };
     // Errores de escritura (Io) son de la salida; el resto, de leer el log.
     let output = match print_log_rows(&reader) {
         Err(e) if !matches!(e, KernelError::Io(_)) => {
-            eprintln!("[reli] no se pudo leer el log: {}", error_text(&e));
+            eprintln!("[reli] cannot read the log: {}", error_text(&e));
             eprintln!(
-                "[reli] copia {} (y su directorio) para analizarlo",
+                "[reli] copy {} (and its directory) to analyse it",
                 shown_path(&db_path)
             );
             return store_error_exit(&e);
@@ -1271,7 +1303,7 @@ fn run_log(audit_dir: &Path) -> i32 {
     match output {
         // `reli log | head`: se cerró la salida, no es un fallo del log.
         Err(KernelError::Io(e)) if e.kind() != std::io::ErrorKind::BrokenPipe => {
-            eprintln!("[reli] error escribiendo la salida, export incompleto: {e}");
+            eprintln!("[reli] cannot write the output, export incomplete: {e}");
             if verdict == EXIT_OK {
                 EXIT_BAD_INPUT
             } else {
@@ -1292,30 +1324,27 @@ fn report_missing_log(audit_dir: &Path, db_path: &Path) -> i32 {
     let witness = keyring::KeyringHead::for_log_without_creating(db_path).and_then(|h| h.load());
     match witness {
         Ok(None) if !anchors_left => {
-            eprintln!("[reli] no hay audit log en {}", shown_path(db_path));
+            eprintln!("[reli] no audit log at {}", shown_path(db_path));
             EXIT_OK
         }
         Ok(None) => {
             eprintln!(
-                "[reli] falta {}, pero quedan sus anchors: lo borraron o lo movieron",
+                "[reli] {} is missing but its anchors remain: it was deleted or moved",
                 shown_path(db_path)
             );
             EXIT_AUDIT
         }
         Ok(Some(head)) => {
             eprintln!(
-                "[reli] falta {}, pero el testigo del llavero dice que el log llegaba a la \
-                 entrada {}: lo borraron o lo movieron",
+                "[reli] {} is missing but the keyring witness says the log reached \
+                 entry {}: it was deleted or moved",
                 shown_path(db_path),
                 head.sequence_no
             );
             EXIT_AUDIT
         }
         Err(e) => {
-            eprintln!(
-                "[reli] no se pudo leer el testigo del llavero: {}",
-                error_text(&e)
-            );
+            eprintln!("[reli] cannot read the keyring witness: {}", error_text(&e));
             EXIT_AUDIT
         }
     }
@@ -1365,14 +1394,14 @@ fn report_log_integrity(reader: &LogReader, db_path: &Path, anchor_dir: &Path) -
     });
     match checked {
         Ok(n) => {
-            eprintln!("[reli] log íntegro: {n} entradas (solo lectura, no se modificó nada)");
+            eprintln!("[reli] log intact: {n} entries (read-only, nothing was modified)");
             EXIT_OK
         }
         Err(e) => {
-            eprintln!("[reli] log NO verificado: {}", error_text(&e));
+            eprintln!("[reli] log NOT verified: {}", error_text(&e));
             eprintln!(
-                "[reli] las entradas se muestran tal como están en el archivo: no son \
-                 fiables a partir del punto indicado"
+                "[reli] entries are shown exactly as stored in the file: they cannot \
+                 be trusted from the point reported above"
             );
             store_error_exit(&e)
         }
@@ -1384,8 +1413,8 @@ fn print_open_actions(store: &AuditStore) {
     let open = store.unresolved_pending();
     if !open.is_empty() {
         println!(
-            "[reli] acciones sin resultado registrado: {open:?} — la próxima acción las \
-             registrará como `abandoned`"
+            "[reli] actions with no recorded outcome: {open:?} — the next action will \
+             record them as `abandoned`"
         );
     }
 }
@@ -1401,7 +1430,7 @@ fn run_sandbox_status(sandbox_path: &Path, audit_dir: &Path) -> i32 {
     println!("[reli] audit db:     {}", db_path.display());
 
     if !db_path.exists() {
-        println!("[reli] audit db:     (todavía no inicializado)");
+        println!("[reli] audit db:     (not initialised yet)");
         println!("[reli] keyring:      {}", keyring::account_label());
         return EXIT_OK;
     }
@@ -1433,11 +1462,11 @@ fn run_reset(
     non_interactive: bool,
 ) -> i32 {
     if !wipe_everything {
-        eprintln!("[reli] reset requiere --wipe-everything (confirmación explícita del alcance)");
+        eprintln!("[reli] reset requires --wipe-everything (explicit confirmation of its scope)");
         return EXIT_BAD_INPUT;
     }
 
-    println!("[reli] reset alcanzará:");
+    println!("[reli] reset will remove:");
     println!("  - sandbox:  {}", sandbox_path.display());
     println!("  - audit db: {}", audit_dir.join("audit.db").display());
     println!("  - anchors:  {}", audit_dir.join("anchors").display());
@@ -1447,25 +1476,25 @@ fn run_reset(
     );
     println!("  - keyring:  {}", keyring::account_label());
     println!(
-        "  - testigo:  {}",
+        "  - witness:  {}",
         keyring::head_label(&audit_dir.join("audit.db"))
     );
 
     if !force {
         if non_interactive {
-            eprintln!("[reli] reset non-interactive sin --force — abortado");
+            eprintln!("[reli] non-interactive reset without --force — aborted");
             return EXIT_REJECTED;
         }
         use std::io::Write;
-        eprint!("[reli] para confirmar escriba WIPE y enter: ");
+        eprint!("[reli] type WIPE and press Enter to confirm: ");
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {
-            eprintln!("[reli] no se pudo leer stdin — abortado");
+            eprintln!("[reli] cannot read stdin — aborted");
             return EXIT_REJECTED;
         }
         if line.trim() != "WIPE" {
-            eprintln!("[reli] confirmación no coincide — abortado");
+            eprintln!("[reli] confirmation does not match — aborted");
             return EXIT_REJECTED;
         }
     }
@@ -1479,7 +1508,7 @@ fn run_reset(
             Ok(lock) => Some(lock),
             Err(KernelError::AuditBusy) => {
                 eprintln!(
-                    "[reli] {} — reset abortado, no se borró nada",
+                    "[reli] {} — reset aborted, nothing was deleted",
                     error_text(&KernelError::AuditBusy)
                 );
                 return EXIT_BUSY;
@@ -1487,7 +1516,7 @@ fn run_reset(
             Err(e) => {
                 // Un archivo dañado no debe impedir la recuperación.
                 eprintln!(
-                    "[reli] aviso: no se pudo bloquear audit.db ({}); se continúa",
+                    "[reli] warning: cannot lock audit.db ({}); continuing",
                     error_text(&e)
                 );
                 None
@@ -1501,46 +1530,43 @@ fn run_reset(
 
     if sandbox_path.exists() {
         match wipe_dir_contents(sandbox_path) {
-            Ok(n) => println!("[reli] sandbox limpiado: {n} entradas"),
+            Ok(n) => println!("[reli] sandbox emptied: {n} entries"),
             Err(e) => {
-                eprintln!("[reli] error limpiando sandbox: {e}");
+                eprintln!("[reli] cannot empty the sandbox: {e}");
                 failures += 1;
             }
         }
     } else {
-        println!("[reli] sandbox: no existía");
+        println!("[reli] sandbox: did not exist");
     }
 
     let anchors = audit_dir.join("anchors");
     if anchors.exists() {
         match std::fs::remove_dir_all(&anchors) {
-            Ok(()) => println!("[reli] anchors eliminados"),
+            Ok(()) => println!("[reli] anchors removed"),
             Err(e) => {
-                eprintln!("[reli] error eliminando anchors: {e}");
+                eprintln!("[reli] cannot remove the anchors: {e}");
                 failures += 1;
             }
         }
     } else {
-        println!("[reli] anchors: no existían");
+        println!("[reli] anchors: did not exist");
     }
 
     match keyring::delete_head(&db_path) {
-        Ok(true) => println!("[reli] keyring: testigo de cabeza eliminado"),
-        Ok(false) => println!("[reli] keyring: no había testigo de cabeza"),
+        Ok(true) => println!("[reli] keyring: head witness removed"),
+        Ok(false) => println!("[reli] keyring: no head witness found"),
         Err(e) => {
-            eprintln!(
-                "[reli] error eliminando el testigo de cabeza: {}",
-                error_text(&e)
-            );
+            eprintln!("[reli] cannot remove the head witness: {}", error_text(&e));
             failures += 1;
         }
     }
 
     match keyring::delete_audit_key() {
-        Ok(true) => println!("[reli] keyring: clave HMAC eliminada"),
-        Ok(false) => println!("[reli] keyring: no había clave almacenada"),
+        Ok(true) => println!("[reli] keyring: HMAC key removed"),
+        Ok(false) => println!("[reli] keyring: no stored key found"),
         Err(e) => {
-            eprintln!("[reli] error eliminando clave keyring: {}", error_text(&e));
+            eprintln!("[reli] cannot remove the keyring key: {}", error_text(&e));
             failures += 1;
         }
     }
@@ -1567,23 +1593,23 @@ fn run_reset(
     );
 
     if failures == 0 {
-        println!("[reli] reset completo");
+        println!("[reli] reset complete");
         EXIT_OK
     } else {
-        eprintln!("[reli] reset terminó con {failures} error(es)");
+        eprintln!("[reli] reset finished with {failures} error(s)");
         EXIT_AUDIT
     }
 }
 
 fn remove_if_exists(path: &Path, label: &str, failures: &mut usize) {
     if !path.exists() {
-        println!("[reli] {label}: no existía");
+        println!("[reli] {label}: did not exist");
         return;
     }
     match std::fs::remove_file(path) {
-        Ok(()) => println!("[reli] {label} eliminado"),
+        Ok(()) => println!("[reli] {label} removed"),
         Err(e) => {
-            eprintln!("[reli] error eliminando {label}: {e}");
+            eprintln!("[reli] cannot remove {label}: {e}");
             *failures += 1;
         }
     }
@@ -1629,6 +1655,15 @@ mod tests {
         assert_terminal_safe(&out);
         assert!(out.contains("\\u{1b}"), "{out}");
         assert!(out.contains("\\u{202e}"), "{out}");
+    }
+
+    #[test]
+    fn terminal_text_always_ends_the_line() {
+        assert_eq!(terminal_text(b"hello"), "hello\n");
+        assert_eq!(terminal_text(b"hello\n"), "hello\n");
+        assert_eq!(terminal_text(b""), "");
+        // Un `\r` final se escapa: no puede devolver el cursor al inicio.
+        assert_eq!(terminal_text(b"a\r"), "a\\u{d}\n");
     }
 
     #[test]
@@ -2364,7 +2399,7 @@ mod tests {
     fn integrity_hint_says_nothing_ran() {
         let hint = sidecar_hint(&rpc_error(rpc_codes::MODEL_INTEGRITY, None)).unwrap();
         assert!(hint.contains("MODEL_SHA256.txt"), "{hint}");
-        assert!(hint.contains("ninguna inferencia"), "{hint}");
+        assert!(hint.contains("No inference"), "{hint}");
     }
 
     #[test]
